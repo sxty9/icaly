@@ -1,0 +1,442 @@
+#!/usr/bin/env bash
+# service — single-file CLI for a holistic service (the holistic-service-template).
+# Owns one-time bootstrap (`init`), install/repair (`setup`) and lifecycle. The systemd
+# unit, Caddy route and the rights drop-in are all generated inline by `setup` — this
+# script is their source of truth (no separate install script, no deploy/ tree).
+#
+# The service id is the single source of truth in permissions/<id>.json, so this CLI
+# auto-detects it from that filename and never hardcodes a name. `init` renames the
+# placeholder everywhere; from then on every command derives its paths from the id.
+
+set -euo pipefail
+
+TEMPLATE_VERSION="0.1.0"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ORIG_ARGS=("$@")
+
+# ── service id (the manifest filename stem == the holistic service id) ────────────
+detect_service_id() {
+  local f
+  for f in "$REPO_ROOT"/permissions/*.json; do
+    [ -e "$f" ] || continue
+    basename "$f" .json
+    return 0
+  done
+  return 1
+}
+: "${SERVICE_ID:=}"
+[ -n "$SERVICE_ID" ] || SERVICE_ID="$(detect_service_id || true)"
+
+# ── config (override via env) ─────────────────────────────────────────────────────
+: "${HOLISTIC_REPO:=}"                                  # holistic repo; autodetected if empty
+: "${SERVICE_APP:=/opt/${SERVICE_ID:-service}}"         # install prefix (binary lives here)
+: "${SERVICE_USER:=${SERVICE_ID:-service}}"             # unprivileged system user
+: "${SERVICE_PORT:=8776}"                               # loopback port for the daemon
+: "${SERVICE_ADMIN_GROUP:=sudo}"                        # Linux group that confers admin
+: "${HOLISTIC_SECRET_FILE:=/etc/holistic/jwt-secret}"   # shared session-signing secret
+: "${HOLISTIC_GROUP:=holistic}"                         # group that owns the shared secret
+
+# ── derived paths (depend on the service id) ──────────────────────────────────────
+UNIT="/etc/systemd/system/${SERVICE_ID}.service"
+CADDY_ROUTE="/etc/caddy/conf.d/${SERVICE_ID}.caddy"
+PERMS_FILE="/etc/holistic/permissions.d/${SERVICE_ID}.json"
+DAEMON_BIN="$SERVICE_APP/bin/${SERVICE_ID}d"
+ADMIN_ENV="$(printf '%s' "${SERVICE_ID:-service}" | tr '[:lower:]' '[:upper:]')_ADMIN_GROUP"
+
+# ── output ────────────────────────────────────────────────────────────────────────
+log()  { [ "${SERVICE_QUIET:-0}" = "1" ] || printf '[%s] %s\n' "${SERVICE_ID:-service}" "$*"; }
+warn() { printf '[%s] warning: %s\n' "${SERVICE_ID:-service}" "$*" >&2; }
+die()  { printf '[%s] error: %s\n' "${SERVICE_ID:-service}" "$*" >&2; exit "${2:-1}"; }
+
+confirm() {
+  [ "${SERVICE_YES:-0}" = "1" ] && return 0
+  local reply
+  printf '[%s] %s [y/N] ' "${SERVICE_ID:-service}" "$1" >&2
+  read -r reply || return 1
+  [[ "$reply" =~ ^[yY]$ ]]
+}
+
+# Re-exec under sudo, preserving env + the original argv, so users never have to type it.
+needs_root() {
+  [ "$(id -u)" -eq 0 ] && return 0
+  command -v sudo >/dev/null || die "must run as root (sudo not found)"
+  exec sudo -E "$0" "${ORIG_ARGS[@]}"
+}
+
+require_id() {
+  [ -n "$SERVICE_ID" ] || die "no permissions/<id>.json found — run from the repo root" 5
+}
+
+# ── holistic repo discovery (assumes holistic is a sibling, like hostek/privleg) ──
+is_holistic_repo() { [ -x "$1/holistic" ] && [ -f "$1/frontend/app/src/registry.ts" ]; }
+
+detect_holistic_repo() {
+  if [ -n "$HOLISTIC_REPO" ]; then
+    is_holistic_repo "$HOLISTIC_REPO" \
+      || die "HOLISTIC_REPO=$HOLISTIC_REPO is not a holistic repo (missing ./holistic or frontend)"
+    ( cd "$HOLISTIC_REPO" && pwd ); return 0
+  fi
+  local c
+  for c in "$REPO_ROOT/../holistic" /code/holistic "$HOME/holistic" /home/*/holistic; do
+    [ -e "$c" ] && is_holistic_repo "$c" && { ( cd "$c" && pwd ); return 0; }
+  done
+  return 1
+}
+
+# ── build ───────────────────────────────────────────────────────────────────────
+ensure_go() {
+  command -v go >/dev/null && return 0
+  log "installing Go toolchain..."
+  apt-get update -qq
+  apt-get install -y -qq golang-go >/dev/null
+  command -v go >/dev/null || die "Go install failed" 4
+}
+
+build_daemon() {
+  ensure_go
+  log "building ${SERVICE_ID}d..."
+  install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 "$SERVICE_APP" "$SERVICE_APP/bin"
+  ( cd "$REPO_ROOT/backend" && GOCACHE="/tmp/${SERVICE_ID}-gocache" go build -o "$DAEMON_BIN" "./cmd/${SERVICE_ID}d" )
+  chown -R "$SERVICE_USER:$SERVICE_USER" "$SERVICE_APP"
+}
+
+# ── inline artifact generators ─────────────────────────────────────────────────────
+write_unit() {
+  cat > "$UNIT" <<EOF
+[Unit]
+Description=${SERVICE_ID} — a holistic service
+After=network.target holistic-dashboard.service
+
+[Service]
+User=$SERVICE_USER
+Group=$SERVICE_USER
+# Validate the same session as the dashboard via the shared JWT secret.
+Environment=HOLISTIC_SECRET_FILE=$HOLISTIC_SECRET_FILE
+# Admin = single Linux source of truth (the sudo group by default).
+Environment=$ADMIN_ENV=$SERVICE_ADMIN_GROUP
+# Calendar data root: the .ics caldir (source of truth) + the derived SQLite index.
+Environment=ICALY_DATA=/var/lib/$SERVICE_ID
+# Canonical mail domain / instance file (read-only) for mailto: ORGANIZER+ATTENDEE addresses.
+Environment=HOLISTIC_INSTANCE=/var/lib/holistic/instance.json
+# Public https origin for absolute URLs the daemon emits (ICS ATTACH, CONFERENCE, feeds). The
+# daemon has no request context for these, so the unit is authoritative — set your origin here.
+Environment=ICALY_PUBLIC_ORIGIN=
+# The holistic mail service (maild), reused as the iMIP transport for external invitations.
+Environment=ICALY_MAILD_URL=http://127.0.0.1:8775
+# Shared secret for the icaly↔maild calendar endpoints (provisioned by setup; absent until then).
+Environment=ICALY_MAIL_SECRET_FILE=/etc/holistic/icaly-mail-secret
+# Location picker geocoding. With no key file present, the picker uses Photon (OpenStreetMap,
+# free, no key). Drop a Google Places (New) API key into this file (chgrp $SERVICE_ID, chmod 0640)
+# to switch to Google automatically. ICALY_GEOCODE_PROVIDER can force "photon"/"google"/"none".
+Environment=ICALY_GEOCODE_KEY_FILE=/etc/holistic/icaly-geocode-key
+Environment=ICALY_GEOCODE_PROVIDER=
+# Instance-wide hard ceiling on upstream geocoding calls per day (cost guard on a shared billed
+# key + courtesy to the free Photon instance). 0 disables it. This is belt-and-suspenders to the
+# per-user rate limit and the provider-side quota you set in the Google Cloud console.
+Environment=ICALY_GEOCODE_DAILY_CAP=5000
+ExecStart=$DAEMON_BIN --listen 127.0.0.1:$SERVICE_PORT
+Restart=on-failure
+RestartSec=2
+# This template performs NO privilege escalation, so it can be sandboxed tightly. A
+# service that adds narrow sudo wrappers (see README) must set NoNewPrivileges=false
+# and relax ProtectSystem — re-verify on the target if you change these.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+RestrictRealtime=true
+# icaly persists .ics calendars + its derived SQLite index here (writable despite ProtectSystem=strict).
+ReadWritePaths=/var/lib/$SERVICE_ID
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+write_caddy_route() {
+  install -d /etc/caddy/conf.d
+  cat > "$CADDY_ROUTE" <<EOF
+# Generated by \`service setup\`. Routes the service API to the Go daemon. Imported by
+# holistic's Caddyfile. Caddy matches this more-specific path (/api/services/$SERVICE_ID/*)
+# before the generic /api/* handler regardless of import order, so it wins.
+handle /api/services/$SERVICE_ID/* {
+	reverse_proxy 127.0.0.1:$SERVICE_PORT {
+		# Server-Sent Events: stream live change frames to the open UI without buffering.
+		flush_interval -1
+	}
+}
+# RFC 6764 discovery: point CalDAV clients at icaly's DAV collection root.
+handle /.well-known/caldav {
+	redir * /api/services/$SERVICE_ID/dav/ 301
+}
+EOF
+}
+
+# Declared rights groups, parsed from the manifest (single source of truth).
+declared_groups() {
+  local src="$REPO_ROOT/permissions/$SERVICE_ID.json"
+  [ -f "$src" ] || return 0
+  grep -oE '"group"[[:space:]]*:[[:space:]]*"hp_[a-z0-9_-]+"' "$src" | grep -oE 'hp_[a-z0-9_-]+'
+}
+
+install_permissions() {
+  # Drop the rights manifest where privleg discovers it, and create the backing groups.
+  # Each right is admin-only by default (default:false): without privleg the groups stay
+  # empty, so behaviour is exactly admin-only. privleg lets an admin grant a non-admin a
+  # specific right = add them to the group. The daemon + UI enforce isAdmin || group ∈ groups.
+  local src="$REPO_ROOT/permissions/$SERVICE_ID.json"
+  [ -f "$src" ] || die "missing $src" 5
+  install -d -o "$HOLISTIC_GROUP" -g "$HOLISTIC_GROUP" -m 0755 /etc/holistic/permissions.d 2>/dev/null \
+    || install -d -m 0755 /etc/holistic/permissions.d
+  install -m 0644 "$src" "$PERMS_FILE"
+  local g
+  for g in $(declared_groups); do
+    groupadd -f "$g"
+  done
+}
+
+grant_secret_access() {
+  if [ ! -f "$HOLISTIC_SECRET_FILE" ]; then
+    warn "$HOLISTIC_SECRET_FILE not found — install the holistic dashboard first"
+    return 0
+  fi
+  getent group "$HOLISTIC_GROUP" >/dev/null \
+    || die "group '$HOLISTIC_GROUP' missing — install the dashboard first" 5
+  usermod -aG "$HOLISTIC_GROUP" "$SERVICE_USER"   # must succeed or the daemon can't read the secret
+  chgrp "$HOLISTIC_GROUP" "$HOLISTIC_SECRET_FILE"
+  chmod 0640 "$HOLISTIC_SECRET_FILE"              # scoped to the holistic + service accounts
+}
+
+# Provision the shared secret for the icaly↔maild calendar endpoints (outbound iMIP internal-send
+# + the inbound calendar webhook). Both daemons read it via the holistic group. Idempotent.
+provision_mail_secret() {
+  local f=/etc/holistic/icaly-mail-secret
+  getent group "$HOLISTIC_GROUP" >/dev/null || { warn "group '$HOLISTIC_GROUP' missing — skipping mail secret"; return 0; }
+  command -v openssl >/dev/null || { warn "openssl not found — skipping mail secret"; return 0; }
+  [ -f "$f" ] || ( umask 077; openssl rand -hex 32 > "$f" )
+  chgrp "$HOLISTIC_GROUP" "$f" 2>/dev/null || true
+  chmod 0640 "$f"
+}
+
+# ── commands ────────────────────────────────────────────────────────────────────────
+cmd_init() {
+  local name="${1:-}" old="myservice"
+  [ -n "$name" ] || die "usage: ./service init <name>" 2
+  [[ "$name" =~ ^[a-z][a-z0-9]{2,19}$ ]] \
+    || die "name must be 3–20 chars: lowercase letters and digits, starting with a letter" 2
+  [ "$name" = "$old" ] && die "name is already '$old'" 2
+  [ -f "$REPO_ROOT/permissions/$old.json" ] \
+    || die "this repo is not the pristine template (already initialized?)" 1
+
+  local up; up="$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')"
+  log "renaming '$old' → '$name'..."
+
+  # Rename the daemon command dir and the rights manifest.
+  [ -d "$REPO_ROOT/backend/cmd/${old}d" ] && mv "$REPO_ROOT/backend/cmd/${old}d" "$REPO_ROOT/backend/cmd/${name}d"
+  mv "$REPO_ROOT/permissions/$old.json" "$REPO_ROOT/permissions/$name.json"
+
+  # Replace identifiers in content files. This CLI is intentionally NOT touched — it
+  # auto-detects the id from the manifest filename, so there is nothing to rewrite here.
+  local f
+  while IFS= read -r -d '' f; do
+    sed -i "s/$old/$name/g; s/MYSERVICE/$up/g" "$f"
+  done < <(find "$REPO_ROOT/backend" "$REPO_ROOT/ui" "$REPO_ROOT/permissions" \
+             -type f \( -name '*.go' -o -name '*.ts' -o -name '*.tsx' -o -name '*.json' -o -name 'go.mod' \) -print0)
+  for f in "$REPO_ROOT/README.md" "$REPO_ROOT/CLAUDE.md"; do
+    [ -f "$f" ] && sed -i "s/$old/$name/g; s/MYSERVICE/$up/g" "$f"
+  done
+
+  log "initialized as '$name'."
+  log "next: edit ui/index.tsx displayName + the backend handlers, then 'sudo ./service setup'."
+}
+
+cmd_setup() {
+  require_id
+  needs_root
+  local holistic; holistic="$(detect_holistic_repo)" \
+    || die "holistic repo not found — set HOLISTIC_REPO=/path/to/holistic" 5
+  log "using holistic repo: $holistic"
+
+  log "system user + directories..."
+  getent group "$SERVICE_USER" >/dev/null || groupadd --system "$SERVICE_USER"
+  getent passwd "$SERVICE_USER" >/dev/null \
+    || useradd --system --gid "$SERVICE_USER" --shell /usr/sbin/nologin --home-dir "/var/lib/$SERVICE_ID" "$SERVICE_USER"
+  install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 "$SERVICE_APP" "$SERVICE_APP/bin" "/var/lib/$SERVICE_ID"
+
+  build_daemon
+
+  log "granting read on the shared JWT secret..."
+  grant_secret_access
+
+  log "provisioning the icaly↔maild shared secret..."
+  provision_mail_secret
+
+  log "configuring systemd..."
+  write_unit
+  systemctl daemon-reload
+  systemctl enable "$SERVICE_ID" >/dev/null 2>&1 || true
+
+  log "adding Caddy route..."
+  write_caddy_route
+
+  log "declaring rights (permissions.d) + backing groups..."
+  install_permissions
+
+  log "linking UI plugin into holistic + rebuilding dashboard SPA..."
+  install -d "$holistic/frontend/external"
+  ln -sfn "$REPO_ROOT/ui" "$holistic/frontend/external/$SERVICE_ID"
+  # Rebuilds the SPA (now bundling this plugin), recopies www, reinstalls the
+  # import-enabled Caddyfile and reloads Caddy — picking up conf.d/$SERVICE_ID.caddy.
+  "$holistic/holistic" setup dashboard
+
+  systemctl restart "$SERVICE_ID"
+  if ! systemctl is-active --quiet "$SERVICE_ID"; then
+    journalctl -u "$SERVICE_ID" -n 20 --no-pager >&2 || true
+    die "$SERVICE_ID failed to start" 4
+  fi
+  log "installed and started — \"$SERVICE_ID\" is live in the holistic sidebar"
+}
+
+cmd_build() {
+  require_id
+  needs_root
+  build_daemon
+  if systemctl is-active --quiet "$SERVICE_ID"; then
+    systemctl restart "$SERVICE_ID"
+    log "rebuilt and restarted ${SERVICE_ID}d"
+  else
+    log "rebuilt ${SERVICE_ID}d (service not running)"
+  fi
+}
+
+cmd_lifecycle() {
+  require_id
+  needs_root
+  local action="$1"
+  systemctl "$action" "$SERVICE_ID" && log "$action: $SERVICE_ID" \
+    || die "'$action $SERVICE_ID' failed — installed? run 'sudo $0 setup'"
+}
+
+cmd_update() {
+  require_id
+  log "pulling latest..."
+  git -C "$REPO_ROOT" pull --ff-only
+  cmd_setup
+}
+
+cmd_status() {
+  require_id
+  local holistic plugin state
+  state="$(systemctl is-active "$SERVICE_ID" 2>/dev/null || true)"
+  echo "── $SERVICE_ID (holistic-service-template $TEMPLATE_VERSION) ──"
+  printf '  %-16s %s\n' "daemon:" "${state:-unknown}"
+  printf '  %-16s %s\n' "listen:" "127.0.0.1:$SERVICE_PORT"
+  printf '  %-16s %s\n' "binary:" "$([ -x "$DAEMON_BIN" ] && echo "$DAEMON_BIN" || echo '(not built)')"
+  printf '  %-16s %s\n' "unit:"   "$([ -f "$UNIT" ] && echo "$UNIT" || echo missing)"
+  printf '  %-16s %s\n' "route:"  "$([ -f "$CADDY_ROUTE" ] && echo "$CADDY_ROUTE" || echo missing)"
+  printf '  %-16s %s\n' "rights:" "$([ -f "$PERMS_FILE" ] && echo "$PERMS_FILE" || echo missing)"
+  if holistic="$(detect_holistic_repo 2>/dev/null)"; then
+    plugin="$holistic/frontend/external/$SERVICE_ID"
+    printf '  %-16s %s\n' "plugin:" "$([ -L "$plugin" ] && echo "linked ($holistic)" || echo "missing ($holistic)")"
+  else
+    printf '  %-16s %s\n' "plugin:" "(holistic repo not found)"
+  fi
+  if command -v systemctl >/dev/null && [ -f "$UNIT" ]; then
+    echo
+    echo "── systemctl status $SERVICE_ID ──"
+    systemctl --no-pager --lines=3 status "$SERVICE_ID" 2>&1 || true
+  fi
+}
+
+cmd_uninstall() {
+  require_id
+  needs_root
+  local purge=0
+  [ "${1:-}" = "--purge" ] && purge=1
+  confirm "remove $SERVICE_ID from this server${purge:+ (and purge user + $SERVICE_APP)}?" || die "aborted" 10
+
+  systemctl disable --now "$SERVICE_ID" >/dev/null 2>&1 || true
+  rm -f "$UNIT"; systemctl daemon-reload
+  rm -f "$CADDY_ROUTE" "$PERMS_FILE"
+
+  local holistic
+  if holistic="$(detect_holistic_repo 2>/dev/null)"; then
+    rm -f "$holistic/frontend/external/$SERVICE_ID"
+    log "rebuilding dashboard SPA without $SERVICE_ID..."
+    "$holistic/holistic" setup dashboard || warn "dashboard rebuild failed — run it manually to drop the tab"
+  else
+    warn "holistic repo not found — remove frontend/external/$SERVICE_ID + rebuild the SPA manually"
+  fi
+
+  if [ "$purge" = "1" ]; then
+    userdel "$SERVICE_USER" >/dev/null 2>&1 || true
+    groupdel "$SERVICE_USER" >/dev/null 2>&1 || true
+    local g
+    for g in $(declared_groups); do
+      groupdel "$g" >/dev/null 2>&1 || true
+    done
+    rm -rf "$SERVICE_APP" "/var/lib/$SERVICE_ID"
+    log "purged user, rights groups, $SERVICE_APP, /var/lib/$SERVICE_ID"
+  fi
+  log "uninstalled"
+}
+
+cmd_help() {
+  cat <<EOF
+service — CLI for a holistic service (holistic-service-template $TEMPLATE_VERSION).
+
+Usage:
+  ./service init <name>          One-time bootstrap: rename the placeholder 'myservice' to
+                                 <name> across the repo (module, plugin id, rights group).
+  sudo ./service setup           Install/repair as a holistic service: build the daemon, wire
+                                 systemd + Caddy, declare rights, link the UI plugin and rebuild
+                                 the dashboard SPA. Self-elevates via sudo.
+  sudo ./service build           Rebuild the Go daemon only, then restart if running
+  sudo ./service start|stop|restart   Control the daemon
+  ./service status               Show daemon, route, rights and plugin-link health
+  sudo ./service update          git pull --ff-only + re-run setup
+  sudo ./service uninstall [--purge]  Remove (--purge also drops the user + $SERVICE_APP)
+  ./service help | version
+
+Quickstart:
+  ./service init mytool          # rename the placeholder
+  sudo ./service setup           # HOLISTIC_REPO is autodetected (sibling ../holistic, /code/holistic, …)
+
+Env (override defaults):
+  HOLISTIC_REPO        path to the holistic repo (autodetected if unset)
+  SERVICE_PORT         loopback port for the daemon (default $SERVICE_PORT)
+  SERVICE_ADMIN_GROUP  Linux group that confers admin (default sudo)
+  SERVICE_YES=1        skip confirmation prompts   ·   SERVICE_QUIET=1  only warnings/errors
+
+Generated artifacts (this script is their source of truth):
+  $UNIT
+  $CADDY_ROUTE
+  $PERMS_FILE
+
+Exit codes: 0 ok · 1 generic · 2 usage · 4 external · 5 config-state · 10 declined
+EOF
+}
+
+# ── dispatch ──────────────────────────────────────────────────────────────────────
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    init)                 cmd_init "$@" ;;
+    setup)                cmd_setup "$@" ;;
+    build)                cmd_build "$@" ;;
+    start|stop|restart)   cmd_lifecycle "$cmd" ;;
+    status)               cmd_status "$@" ;;
+    update)               cmd_update "$@" ;;
+    uninstall)            cmd_uninstall "$@" ;;
+    version|-v|--version) echo "holistic-service-template $TEMPLATE_VERSION" ;;
+    help|-h|--help)       cmd_help ;;
+    *) die "unknown command: $cmd (run './service help')" 2 ;;
+  esac
+}
+
+main "$@"

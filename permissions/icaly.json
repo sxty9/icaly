@@ -1,0 +1,63 @@
+{
+  "service": "icaly",
+  "version": 1,
+  "categories": [
+    {
+      "id": "calendar",
+      "label": "Calendar",
+      "description": "Per-user access to one's own and shared calendars.",
+      "permissions": [
+        {
+          "id": "view",
+          "label": "Use calendar",
+          "description": "Read your own and shared calendars, subscribe to feeds, and respond to invitations.",
+          "group": "hp_icaly_view",
+          "default": true
+        },
+        {
+          "id": "edit",
+          "label": "Edit events",
+          "description": "Create, update and delete events in your own and write-shared calendars.",
+          "group": "hp_icaly_edit",
+          "default": true
+        },
+        {
+          "id": "share",
+          "label": "Share & publish",
+          "description": "Create extra calendars, manage sharing, app passwords and public feeds.",
+          "group": "hp_icaly_share",
+          "default": false
+        },
+        {
+          "id": "invite",
+          "label": "Invite externals",
+          "description": "Invite people outside this server by email (requires send-mail too).",
+          "group": "hp_icaly_invite",
+          "default": false
+        },
+        {
+          "id": "delegate",
+          "label": "Delegate access",
+          "description": "Act on a calendar delegated to you by another user.",
+          "group": "hp_icaly_delegate",
+          "default": false
+        }
+      ]
+    },
+    {
+      "id": "admin",
+      "label": "Administration",
+      "description": "Cross-calendar and instance resource administration.",
+      "permissions": [
+        {
+          "id": "admin",
+          "label": "Administer calendars",
+          "description": "Manage other users' calendars and instance resources (rooms, equipment), and read audit trails.",
+          "group": "hp_icaly_admin",
+          "default": false,
+          "dangerous": true
+        }
+      ]
+    }
+  ]
+}
