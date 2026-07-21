@@ -295,24 +295,32 @@ func (s *Store) CreateCalendarID(user, id, name, color, tz string) (event.Calend
 }
 
 // UpdateCalendar applies CalDAV PROPPATCH changes: a non-nil name/color is written, nil is left
-// untouched. Returns ErrNotFound for an unknown calendar.
+// untouched. The requested columns are written in ONE statement, so a concurrent reader can never
+// observe a half-applied change (new name, old colour) and the atomicity PROPPATCH mandates
+// (RFC 4918 §9.2, which the caldav layer promises) holds at the storage layer too — one Exec sets
+// every requested column or none. Returns ErrNotFound for an unknown calendar.
 func (s *Store) UpdateCalendar(user, id string, name, color *string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.calOwned(user, id) {
 		return ErrNotFound
 	}
+	sets := make([]string, 0, 2)
+	args := make([]any, 0, 3)
 	if name != nil {
-		if _, err := s.db.Exec(`UPDATE calendars SET name=? WHERE owner=? AND id=?`, *name, user, id); err != nil {
-			return err
-		}
+		sets = append(sets, "name=?")
+		args = append(args, *name)
 	}
 	if color != nil {
-		if _, err := s.db.Exec(`UPDATE calendars SET color=? WHERE owner=? AND id=?`, *color, user, id); err != nil {
-			return err
-		}
+		sets = append(sets, "color=?")
+		args = append(args, *color)
 	}
-	return nil
+	if len(sets) == 0 {
+		return nil // nothing requested (e.g. an empty PROPPATCH of writable props) → no-op
+	}
+	args = append(args, user, id)
+	_, err := s.db.Exec(`UPDATE calendars SET `+strings.Join(sets, ", ")+` WHERE owner=? AND id=?`, args...)
+	return err
 }
 
 func (s *Store) ensureHome(user string) error {
@@ -1000,7 +1008,9 @@ func (s *Store) SyncCollection(user, calID string, since int64) ([]SyncChange, i
 // seq that has been trimmed (and is therefore no longer retrievable) — derived from the seqs
 // actually deleted, not from the timestamp ordering — so a backward clock step that trims a
 // high seq while lower seqs survive cannot leave a gap that is silently served. min_valid_seq is
-// monotonic (max with its previous value). Intended for a periodic maintenance pass.
+// monotonic (max with its previous value). Each calendar's delete-and-advance is one transaction,
+// so a partial failure can never leave trimmed rows behind an un-advanced floor — which would let
+// a stale token look valid and be served an incomplete delta. Intended for a periodic pass.
 func (s *Store) Compact(before time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1024,23 +1034,34 @@ func (s *Store) Compact(before time.Time) error {
 	}
 	rows.Close()
 	for _, c := range cals {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
 		var maxDel sql.NullInt64
-		if err := s.db.QueryRow(`SELECT MAX(seq) FROM changelog WHERE owner=? AND calendar_id=? AND at<?`,
+		if err := tx.QueryRow(`SELECT MAX(seq) FROM changelog WHERE owner=? AND calendar_id=? AND at<?`,
 			c.owner, c.id, cutoff).Scan(&maxDel); err != nil {
+			_ = tx.Rollback()
 			return err
 		}
 		if !maxDel.Valid {
+			_ = tx.Rollback()
 			continue // nothing to trim for this calendar
 		}
-		if _, err := s.db.Exec(`DELETE FROM changelog WHERE owner=? AND calendar_id=? AND at<?`,
+		if _, err := tx.Exec(`DELETE FROM changelog WHERE owner=? AND calendar_id=? AND at<?`,
 			c.owner, c.id, cutoff); err != nil {
+			_ = tx.Rollback()
 			return err
 		}
 		floor := c.minValid
 		if maxDel.Int64 > floor {
 			floor = maxDel.Int64
 		}
-		if _, err := s.db.Exec(`UPDATE calendars SET min_valid_seq=? WHERE owner=? AND id=?`, floor, c.owner, c.id); err != nil {
+		if _, err := tx.Exec(`UPDATE calendars SET min_valid_seq=? WHERE owner=? AND id=?`, floor, c.owner, c.id); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
 			return err
 		}
 	}

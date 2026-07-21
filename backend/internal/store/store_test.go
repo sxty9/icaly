@@ -317,6 +317,58 @@ func TestMkcalendarAndProppatch(t *testing.T) {
 	}
 }
 
+// TestUpdateCalendarAtomicWrite pins the atomic-access contract: name and color set together must
+// land as one write (PROPPATCH commonly sets both — RFC 4918 §9.2 requires it atomic), a single
+// field leaves the other untouched, and an empty request is a no-op rather than an error.
+func TestUpdateCalendarAtomicWrite(t *testing.T) {
+	st := openTest(t)
+	if _, err := st.CreateCalendarID("alice", "work", "Work", "#ff0000", ""); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	get := func() event.Calendar {
+		cals, _ := st.Calendars("alice")
+		for _, c := range cals {
+			if c.ID == "work" {
+				return c
+			}
+		}
+		t.Fatalf("calendar 'work' vanished")
+		return event.Calendar{}
+	}
+
+	// Both fields in one call: both must be applied (the write is a single statement, so a reader
+	// can never see the new name paired with the old colour).
+	name, color := "Office", "#00ff00"
+	if err := st.UpdateCalendar("alice", "work", &name, &color); err != nil {
+		t.Fatalf("update both: %v", err)
+	}
+	if c := get(); c.Name != "Office" || c.Color != "#00ff00" {
+		t.Fatalf("both-field update not applied: name=%q color=%q", c.Name, c.Color)
+	}
+
+	// A single field leaves the other untouched.
+	only := "#0000ff"
+	if err := st.UpdateCalendar("alice", "work", nil, &only); err != nil {
+		t.Fatalf("update color-only: %v", err)
+	}
+	if c := get(); c.Name != "Office" || c.Color != "#0000ff" {
+		t.Fatalf("color-only update disturbed name: name=%q color=%q", c.Name, c.Color)
+	}
+
+	// Empty request (both nil): a no-op, no error, nothing changed.
+	if err := st.UpdateCalendar("alice", "work", nil, nil); err != nil {
+		t.Fatalf("empty update should be a no-op, got %v", err)
+	}
+	if c := get(); c.Name != "Office" || c.Color != "#0000ff" {
+		t.Fatalf("empty update mutated the calendar: name=%q color=%q", c.Name, c.Color)
+	}
+
+	// Unknown calendar is still reported as not found.
+	if err := st.UpdateCalendar("alice", "ghost", &name, nil); err != ErrNotFound {
+		t.Fatalf("update of unknown calendar should be ErrNotFound, got %v", err)
+	}
+}
+
 func TestReconcilerHealsIndex(t *testing.T) {
 	dir := t.TempDir()
 	st, err := Open(dir)
