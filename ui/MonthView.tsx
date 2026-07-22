@@ -4,7 +4,7 @@
 import { type MouseEvent } from 'react';
 import { Box, Grid, Stack, Text, cn } from '@holistic/ui';
 import type { CalEvent } from './types';
-import { WEEKDAYS, colorCss, eventOnDay, fmtTime, monthMatrix, sameDay, startOfDay } from './helpers';
+import { WEEKDAYS, colorCss, eventsOnDay, fmtTime, monthMatrix, sameDay, startOfDay } from './helpers';
 
 interface MonthViewProps {
   anchor: Date;
@@ -31,9 +31,7 @@ export function MonthView({ anchor, events, onDayClick, onEventClick }: MonthVie
       </Grid>
       <Grid cols={7} gap={0}>
         {days.map((day) => {
-          const dayEvents = events
-            .filter((ev) => eventOnDay(ev, day))
-            .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
+          const dayEvents = eventsOnDay(events, day);
           const visible = dayEvents.slice(0, 3);
           const overflow = dayEvents.length - visible.length;
           const isToday = sameDay(day, today);

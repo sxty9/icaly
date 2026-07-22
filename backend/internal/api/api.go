@@ -261,7 +261,7 @@ func (s *Server) putEvent(w http.ResponseWriter, r *http.Request, u *auth.User) 
 	// an event delivered to them as an attendee (stored organizer is someone else) must NOT trigger
 	// organizer scheduling that mutates other users' calendars.
 	prev, _, _ := s.st.GetEvent(u.Username, calID, ev.UID)
-	isOrganizer := prev == nil || prev.Organizer == nil || prev.Organizer.Email == "" || sameAddr(prev.Organizer.Email, caller)
+	isOrganizer := prev == nil || prev.Organizer == nil || prev.Organizer.Email == "" || event.SameAddr(prev.Organizer.Email, caller)
 	if isOrganizer {
 		ev.Organizer = &event.Participant{Email: caller, Username: u.Username, IsInternal: true} // never trust a client organizer
 	} else {
@@ -386,7 +386,7 @@ func (s *Server) deleteEvent(w http.ResponseWriter, r *http.Request, u *auth.Use
 	// organizer may cancel for everyone; an attendee's delete just removes their own copy (it must
 	// never reach into other users' calendars). Authority comes from the stored ORGANIZER.
 	prev, _, _ := s.st.GetEvent(u.Username, calID, uid)
-	isOrganizer := prev == nil || prev.Organizer == nil || prev.Organizer.Email == "" || sameAddr(prev.Organizer.Email, caller)
+	isOrganizer := prev == nil || prev.Organizer == nil || prev.Organizer.Email == "" || event.SameAddr(prev.Organizer.Email, caller)
 
 	if req.RecurrenceID != nil && (scope == "this" || scope == "following") {
 		following := scope == "following"
@@ -1006,14 +1006,6 @@ func (s *Server) calendarOf(user, calID string) (event.Calendar, bool) {
 	return event.Calendar{}, false
 }
 
-// sameAddr compares two calendar-user addresses, ignoring case, whitespace and a mailto: scheme.
-func sameAddr(a, b string) bool {
-	n := func(s string) string {
-		return strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(s), "mailto:")))
-	}
-	return n(a) != "" && n(a) == n(b)
-}
-
 // dedupAttendees keeps the first occurrence of each distinct address (case/scheme-insensitive),
 // so an event never carries — or invites — the same person twice.
 func dedupAttendees(in []event.Participant) []event.Participant {
@@ -1023,7 +1015,7 @@ func dedupAttendees(in []event.Participant) []event.Participant {
 	seen := make(map[string]bool, len(in))
 	out := in[:0]
 	for _, a := range in {
-		k := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(a.Email), "mailto:")))
+		k := event.NormAddr(a.Email)
 		if k == "" || seen[k] {
 			continue
 		}
@@ -1045,7 +1037,7 @@ func mergePartStats(ev, prev *event.Event) {
 			continue // the client asserted a status — respect it
 		}
 		for _, p := range prev.Attendees {
-			if sameAddr(p.Email, ev.Attendees[i].Email) && p.PartStat != "" && p.PartStat != "NEEDS-ACTION" {
+			if event.SameAddr(p.Email, ev.Attendees[i].Email) && p.PartStat != "" && p.PartStat != "NEEDS-ACTION" {
 				ev.Attendees[i].PartStat = p.PartStat
 				break
 			}
