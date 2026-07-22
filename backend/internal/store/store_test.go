@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -483,6 +484,66 @@ func TestStoreRecurrenceScopedEdits(t *testing.T) {
 	}
 	if count() != 2 {
 		t.Fatalf("after truncate want 2, got %d", count())
+	}
+}
+
+func TestDeletedEventStaysDeletedAfterReconcile(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	start := time.Date(2026, 7, 1, 9, 0, 0, 0, time.UTC)
+	if _, err := st.PutEvent("alice", "personal", &event.Event{UID: "gone", Summary: "Gone", Start: start, End: start.Add(time.Hour)}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := st.DeleteEvent("alice", "personal", "gone"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	// The source .ics must be gone, or a restart reconcile would re-index the leftover file and
+	// resurrect the deleted event (the delete must remove the source of truth, not just the index).
+	if _, statErr := os.Stat(filepath.Join(dir, "calendars", "alice", "personal", "gone.ics")); !os.IsNotExist(statErr) {
+		t.Fatalf("source .ics must be removed by delete; stat err=%v", statErr)
+	}
+	_ = st.Close()
+
+	st2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = st2.Close() })
+	if _, _, err := st2.GetEvent("alice", "personal", "gone"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted event resurrected after reconcile: err=%v", err)
+	}
+	if metas, _ := st2.EventMetas("alice", "personal"); len(metas) != 0 {
+		t.Fatalf("expected no events after reconcile, got %+v", metas)
+	}
+}
+
+func TestDeleteAbortsWhenSourceFileRemovalFails(t *testing.T) {
+	st := openTest(t)
+	start := time.Date(2026, 7, 1, 9, 0, 0, 0, time.UTC)
+	if _, err := st.PutEvent("alice", "personal", &event.Event{UID: "keepme", Summary: "Keep", Start: start, End: start.Add(time.Hour)}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	var emitted []Change
+	st.OnChange(func(c Change) { emitted = append(emitted, c) })
+
+	// Force the .ics removal to fail: the delete must abort with the event fully intact — never
+	// commit a tombstone (which a reconcile could not undo) while the source file survives.
+	st.removeFile = func(string) error { return errors.New("simulated removal failure") }
+	if err := st.DeleteEvent("alice", "personal", "keepme"); err == nil {
+		t.Fatal("expected DeleteEvent to fail when the source file cannot be removed")
+	}
+	if _, _, err := st.GetEvent("alice", "personal", "keepme"); err != nil {
+		t.Fatalf("event must remain after an aborted delete, got %v", err)
+	}
+	if len(emitted) != 0 {
+		t.Fatalf("an aborted delete must emit no change, got %+v", emitted)
+	}
+	// Index and file still agree, so a reconcile would be a no-op (no resurrection, no phantom put).
+	if raws, err := st.RawEvents("alice", "personal"); err != nil || len(raws) != 1 {
+		t.Fatalf("source file must survive an aborted delete: got %d err=%v", len(raws), err)
 	}
 }
 

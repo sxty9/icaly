@@ -95,6 +95,10 @@ type Store struct {
 
 	subMu sync.RWMutex
 	subs  []func(Change) // live-change observers (push hub); notified after commit
+
+	// removeFile deletes an event's source-of-truth .ics file. It is a field only so a test can
+	// force a removal failure and assert the delete aborts atomically; production always uses os.Remove.
+	removeFile func(path string) error
 }
 
 // OnChange registers an observer invoked (synchronously, after commit) for every mutation.
@@ -134,7 +138,7 @@ func Open(root string) (*Store, error) {
 		return nil, err
 	}
 	migrate(db)
-	st := &Store{root: root, db: db}
+	st := &Store{root: root, db: db, removeFile: os.Remove}
 	if err := st.reconcile(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -592,19 +596,23 @@ func (s *Store) ListEvents(user, calID string, from, to time.Time) ([]*event.Eve
 	return out, nil
 }
 
-// DeleteEvent removes an event, recording a tombstone in the change-log. The index delete and
-// the tombstone are one transaction; the .ics file is removed only after that commit.
+// DeleteEvent removes an event, recording a tombstone in the change-log. The source-of-truth
+// .ics file is removed BEFORE the index+tombstone transaction, so a crash (or a failed removal)
+// between the two steps leaves the reconciler converging toward "deleted" — an index row with no
+// file is tombstoned — instead of resurrecting the event, which is what a leftover file with no
+// index row would do (reconcile re-indexes such a file as a "put"). This mirrors the write path,
+// which writes the file before the index. A genuine removal failure aborts the delete with the
+// event still fully intact, rather than silently committing a tombstone that cannot be undone.
 func (s *Store) DeleteEvent(user, calID, uid string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.calOwned(user, calID) {
 		return ErrNotFound
 	}
-	if err := s.indexDelete(user, calID, uid); err != nil {
+	if err := s.removeFile(s.icsPath(user, calID, uid)); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	_ = os.Remove(s.icsPath(user, calID, uid))
-	return nil
+	return s.indexDelete(user, calID, uid)
 }
 
 // ── recurring-series scoped edits (Google-Calendar-style: this / this+following / all) ──
@@ -750,6 +758,12 @@ func (s *Store) CalendarByFeedToken(token string) (event.Calendar, error) {
 // RawEvents returns the verbatim stored .ics bytes of every event in a calendar. These are the
 // single source of truth (never re-encoded), so the ICS feed and export stay byte-faithful.
 func (s *Store) RawEvents(user, calID string) ([][]byte, error) {
+	// Hold the write lock so the whole-calendar scan is a consistent snapshot: a concurrent
+	// PutRaw/DeleteEvent (which rename/remove files under this same lock) cannot make the feed or
+	// export observe a half-applied write — one event's new bytes but not another's, or a file
+	// caught mid-delete. Mirrors SyncCollection, which likewise snapshots under s.mu.
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.calOwned(user, calID) {
 		return nil, ErrNotFound
 	}
@@ -929,11 +943,14 @@ func (s *Store) DeleteRaw(user, calID, uid, ifMatch string) error {
 	if ifMatch != "" && !etagMatch(ifMatch, curEtag) {
 		return ErrPreconditionFailed
 	}
-	if err := s.indexDelete(user, calID, uid); err != nil {
+	// Remove the source file before the index+tombstone transaction (see DeleteEvent): a crash
+	// converges toward deleted, and a real removal failure aborts with the event intact rather
+	// than committing an un-undoable tombstone. The precondition check above already confirmed the
+	// index row exists, so indexDelete (under this same lock) still matches it.
+	if err := s.removeFile(s.icsPath(user, calID, uid)); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	_ = os.Remove(s.icsPath(user, calID, uid))
-	return nil
+	return s.indexDelete(user, calID, uid)
 }
 
 // SyncCollection computes the WebDAV-Sync (RFC 6578) delta for a calendar. since is the numeric
