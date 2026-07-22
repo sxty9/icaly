@@ -97,6 +97,17 @@ export function eventOnDay(ev: CalEvent, day: Date): boolean {
   return s.getTime() < de && e.getTime() > ds;
 }
 
+// Chronological comparator for event instances, by start instant. The one ordering every view uses.
+export function byStart(a: CalEvent, b: CalEvent): number {
+  return new Date(a.start).getTime() - new Date(b.start).getTime();
+}
+
+// The event instances intersecting a given calendar day, in chronological order. Shared by the
+// month and week grids so the day-cell logic lives in one place rather than repeated per view.
+export function eventsOnDay(events: CalEvent[], day: Date): CalEvent[] {
+  return events.filter((ev) => eventOnDay(ev, day)).sort(byStart);
+}
+
 // ── colours (RFC 7986 COLOR uses CSS3 names; these render directly as CSS) ───────────────
 export const COLORS: { name: string; css: string }[] = [
   { name: 'dodgerblue', css: '#3b82f6' },

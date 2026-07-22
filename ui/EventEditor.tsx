@@ -431,11 +431,11 @@ export function EventEditor({ api, ui, calendarId, event, defaultStart, canEdit,
           />
         </Field>
 
-        <Field label="Required attendees" hint="Nach Name/Nickname suchen oder eine E-Mail eingeben. Sie werden benachrichtigt und um Antwort gebeten.">
-          <ContactPicker value={required} onChange={setRequired} onSearch={searchContacts} placeholder="Name oder Adresse …" disabled={!canEdit} />
+        <Field label="Required attendees">
+          <ContactPicker value={required} onChange={setRequired} onSearch={searchContacts} placeholder="Name or address …" disabled={!canEdit} />
         </Field>
-        <Field label="Optional attendees" hint="Zur Information eingeladen; gleich benachrichtigt, aber als optional markiert.">
-          <ContactPicker value={optional} onChange={setOptional} onSearch={searchContacts} placeholder="Name oder Adresse …" disabled={!canEdit} />
+        <Field label="Optional attendees">
+          <ContactPicker value={optional} onChange={setOptional} onSearch={searchContacts} placeholder="Name or address …" disabled={!canEdit} />
         </Field>
 
         <Field label="Categories" hint="Comma separated">

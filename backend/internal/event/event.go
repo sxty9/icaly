@@ -5,7 +5,25 @@
 // Phase 3; until then this covers the Google/Outlook attribute set the requirements call for.
 package event
 
-import "time"
+import (
+	"strings"
+	"time"
+)
+
+// NormAddr canonicalizes a calendar-user address for identity comparison: it strips a leading
+// "mailto:" scheme, trims surrounding whitespace and lower-cases. It is the single source of
+// truth for address identity across the service (attendee matching, dedup, organizer authority);
+// callers compare NormAddr(x) values rather than re-implementing the normalization inline.
+func NormAddr(s string) string {
+	return strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(s), "mailto:")))
+}
+
+// SameAddr reports whether two calendar-user addresses denote the same participant, ignoring
+// case, surrounding whitespace and a "mailto:" scheme. The empty address matches nothing.
+func SameAddr(a, b string) bool {
+	na := NormAddr(a)
+	return na != "" && na == NormAddr(b)
+}
 
 // Participant is an ORGANIZER or ATTENDEE. Email is the calendar-user address (without the
 // "mailto:" scheme). IsInternal/Username are resolved at write time (a Holistic Linux user)

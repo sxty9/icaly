@@ -2,7 +2,7 @@
 // (Minimalism maxim) and the natural fallback on small screens.
 import { Box, EmptyState, Stack, Text, cn } from '@holistic/ui';
 import type { CalEvent } from './types';
-import { colorCss, fmtDayLong, fmtTime } from './helpers';
+import { byStart, colorCss, fmtDayLong, fmtTime } from './helpers';
 
 interface AgendaViewProps {
   events: CalEvent[];
@@ -13,7 +13,7 @@ export function AgendaView({ events, onEventClick }: AgendaViewProps) {
   if (events.length === 0) {
     return <EmptyState title="Nothing scheduled" description="No events in this range." />;
   }
-  const sorted = [...events].sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
+  const sorted = [...events].sort(byStart);
   const groups = new Map<string, { day: Date; items: CalEvent[] }>();
   for (const ev of sorted) {
     const d = new Date(ev.start);
