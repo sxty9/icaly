@@ -290,7 +290,7 @@ func (s *Scheduler) OnOccurrenceCancel(organizer string, ev *event.Event, recurr
 // classify reports whether an address is an internal Holistic user at this instance's mail
 // domain (and resolves the local account name). Empty mail domain ⇒ everyone is external.
 func (s *Scheduler) classify(email string) (string, bool) {
-	email = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(email, "mailto:")))
+	email = event.NormAddr(email)
 	at := strings.LastIndex(email, "@")
 	if at <= 0 {
 		return "", false
@@ -316,7 +316,7 @@ func (s *Scheduler) firstLocalRecipient(rcpts []string) string {
 
 func setPartStat(ev *event.Event, email, partStat string) {
 	for i := range ev.Attendees {
-		if sameAddr(ev.Attendees[i].Email, email) {
+		if event.SameAddr(ev.Attendees[i].Email, email) {
 			ev.Attendees[i].PartStat = partStat
 			return
 		}
@@ -325,7 +325,7 @@ func setPartStat(ev *event.Event, email, partStat string) {
 
 func partStatFor(ev *event.Event, email string) string {
 	for _, a := range ev.Attendees {
-		if sameAddr(a.Email, email) {
+		if event.SameAddr(a.Email, email) {
 			return a.PartStat
 		}
 	}
@@ -334,18 +334,11 @@ func partStatFor(ev *event.Event, email string) string {
 
 func attendeeMatches(ev *event.Event, addr string) bool {
 	for _, a := range ev.Attendees {
-		if sameAddr(a.Email, addr) {
+		if event.SameAddr(a.Email, addr) {
 			return true
 		}
 	}
 	return false
-}
-
-func sameAddr(a, b string) bool {
-	norm := func(s string) string {
-		return strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(s), "mailto:")))
-	}
-	return norm(a) != "" && norm(a) == norm(b)
 }
 
 func titleOf(ev *event.Event) string {

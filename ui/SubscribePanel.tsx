@@ -37,15 +37,6 @@ export function SubscribePanel({ api, ui, calendar, canImport, canShare, usernam
   const webcal = feedUrl ? webcalURL(feedUrl) : '';
   const davUrl = api.url('dav/');
 
-  async function copyText(value: string, label: string) {
-    try {
-      await navigator.clipboard.writeText(value);
-      ui.toast({ title: `${label} copied`, variant: 'success' });
-    } catch {
-      ui.toast({ title: 'Copy failed', description: value, variant: 'error' });
-    }
-  }
-
   async function importIcs() {
     const text = await pickTextFile();
     if (!text) return;
@@ -73,27 +64,13 @@ export function SubscribePanel({ api, ui, calendar, canImport, canShare, usernam
     <Modal open onOpenChange={(o) => !o && onClose()} title={`Subscribe & share — ${calendar.name}`} size="md">
       <Stack gap={5}>
         <Field label="Subscription URL (webcal)" hint="Read-only. Add in Apple Calendar, Google, Thunderbird … Subscribers refresh periodically, not instantly.">
-          <Stack direction="row" gap={2}>
-            <Box className="grow">
-              <Input className="w-full" value={webcal} readOnly onFocus={(e) => e.target.select()} />
-            </Box>
-            <Button variant="secondary" onClick={() => copyText(webcal, 'Subscription URL')} disabled={!webcal}>
-              Copy
-            </Button>
-          </Stack>
+          <CopyField ui={ui} value={webcal} label="Subscription URL" />
         </Field>
 
         <Field label="CalDAV (two-way sync)" hint="Add a CalDAV account in your client with this server URL and your username, using an app password below.">
           <Stack gap={2}>
-            <Stack direction="row" gap={2}>
-              <Box className="grow">
-                <Input className="w-full" value={davUrl} readOnly onFocus={(e) => e.target.select()} />
-              </Box>
-              <Button variant="secondary" onClick={() => copyText(davUrl, 'Server URL')}>
-                Copy
-              </Button>
-            </Stack>
-            <Input value={username} readOnly onFocus={(e) => e.target.select()} />
+            <CopyField ui={ui} value={davUrl} label="Server URL" />
+            <CopyField ui={ui} value={username} label="Username" />
           </Stack>
         </Field>
 
@@ -111,6 +88,44 @@ export function SubscribePanel({ api, ui, calendar, canImport, canShare, usernam
         </Stack>
       </Stack>
     </Modal>
+  );
+}
+
+// copyToClipboard is the single clipboard access point for this panel: it writes the value and
+// reports the outcome via a toast, so every "Copy" affordance behaves identically (no parallel
+// copy paths). The value rides the error toast's description as a manual-copy fallback.
+async function copyToClipboard(ui: ServiceContextProps['ui'], value: string, label: string) {
+  try {
+    await navigator.clipboard.writeText(value);
+    ui.toast({ title: `${label} copied`, variant: 'success' });
+  } catch {
+    ui.toast({ title: 'Copy failed', description: value, variant: 'error' });
+  }
+}
+
+// CopyField is the one read-only "value + Copy" row used for every connection credential (feed
+// URL, DAV URL, username, app password). Consolidating the repeated markup keeps the affordances
+// uniform and routes all copies through copyToClipboard. Copy is disabled while the value is empty.
+function CopyField({
+  ui,
+  value,
+  label,
+  mono,
+}: {
+  ui: ServiceContextProps['ui'];
+  value: string;
+  label: string;
+  mono?: boolean;
+}) {
+  return (
+    <Stack direction="row" gap={2}>
+      <Box className="grow">
+        <Input className={mono ? 'w-full font-mono' : 'w-full'} value={value} readOnly onFocus={(e) => e.target.select()} />
+      </Box>
+      <Button variant="secondary" onClick={() => copyToClipboard(ui, value, label)} disabled={!value}>
+        Copy
+      </Button>
+    </Stack>
   );
 }
 
@@ -175,24 +190,7 @@ function AppPasswords({ api, ui }: { api: ServiceApiClient; ui: ServiceContextPr
               <Text variant="caption" color="secondary">
                 Copy this now — it is shown only once. Use it as the password in your calendar app.
               </Text>
-              <Stack direction="row" gap={2}>
-                <Box className="grow">
-                  <Input className="w-full font-mono" value={fresh.token} readOnly onFocus={(e) => e.target.select()} />
-                </Box>
-                <Button
-                  variant="secondary"
-                  onClick={async () => {
-                    try {
-                      await navigator.clipboard.writeText(fresh.token);
-                      ui.toast({ title: 'App password copied', variant: 'success' });
-                    } catch {
-                      ui.toast({ title: 'Copy failed', variant: 'error' });
-                    }
-                  }}
-                >
-                  Copy
-                </Button>
-              </Stack>
+              <CopyField ui={ui} value={fresh.token} label="App password" mono />
             </Stack>
           </Box>
         )}
