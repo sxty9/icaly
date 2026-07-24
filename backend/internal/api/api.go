@@ -407,9 +407,15 @@ func (s *Server) deleteEvent(w http.ResponseWriter, r *http.Request, u *auth.Use
 		return
 	}
 
-	// Whole series (or a non-recurring event).
+	// Whole series (or a non-recurring event). Distinguish a genuinely-missing event (404) from a
+	// server-side failure (500) — matching the CalDAV del handler — so a delete that failed is
+	// never misreported to the client as "already gone".
 	if err := s.st.DeleteEvent(u.Username, calID, uid); err != nil {
-		writeErr(w, http.StatusNotFound, "Event not found")
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "Event not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "Could not delete event")
 		return
 	}
 	if isOrganizer && s.sched != nil && prev != nil && len(prev.Attendees) > 0 {
