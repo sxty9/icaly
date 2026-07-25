@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -561,5 +562,132 @@ func TestCrossUserIsolation(t *testing.T) {
 	}
 	if len(list) != 0 {
 		t.Fatalf("cross-user leak: bob sees %d events", len(list))
+	}
+}
+
+func TestCompactAdvancesFloorToMaxTrimmedSeq(t *testing.T) {
+	st := openTest(t)
+	start := time.Date(2026, 9, 1, 9, 0, 0, 0, time.UTC)
+	// Four events → four change-log rows with monotonic seqs (provisioning writes none).
+	for _, uid := range []string{"a", "b", "c", "d"} {
+		ev := &event.Event{UID: uid, Summary: uid, Start: start, End: start.Add(time.Hour)}
+		if _, err := st.PutEvent("alice", "personal", ev); err != nil {
+			t.Fatalf("put %s: %v", uid, err)
+		}
+	}
+	// Backdate the two oldest rows (a, b) so only they fall before the cutoff; c and d stay recent.
+	var seqB int64
+	if err := st.db.QueryRow(`SELECT seq FROM changelog WHERE owner='alice' AND uid='b'`).Scan(&seqB); err != nil {
+		t.Fatalf("seq of b: %v", err)
+	}
+	old := time.Now().Add(-2 * time.Hour).Unix()
+	if _, err := st.db.Exec(`UPDATE changelog SET at=? WHERE owner='alice' AND seq<=?`, old, seqB); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+
+	if err := st.Compact(time.Now().Add(-1 * time.Hour)); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+
+	// The trimmed rows (a, b) are gone; the recent ones (c, d) survive.
+	var remaining int
+	if err := st.db.QueryRow(`SELECT COUNT(*) FROM changelog WHERE owner='alice'`).Scan(&remaining); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if remaining != 2 {
+		t.Fatalf("expected 2 change-log rows to survive, got %d", remaining)
+	}
+	// The floor advanced to EXACTLY the largest trimmed seq — not lower (which would open a
+	// silent-gap window) and not to a surviving seq. compactCalendar keeps this atomic with the DELETE.
+	var floor int64
+	if err := st.db.QueryRow(`SELECT min_valid_seq FROM calendars WHERE owner='alice' AND id='personal'`).Scan(&floor); err != nil {
+		t.Fatalf("floor: %v", err)
+	}
+	if floor != seqB {
+		t.Fatalf("min_valid_seq should equal the max trimmed seq %d, got %d", seqB, floor)
+	}
+	// A token below the floor is now unservable → 409 (ErrSyncTokenTooOld); one at the floor still syncs.
+	if _, _, err := st.SyncCollection("alice", "personal", seqB-1); err != ErrSyncTokenTooOld {
+		t.Fatalf("token below floor must be ErrSyncTokenTooOld, got %v", err)
+	}
+	if _, _, err := st.SyncCollection("alice", "personal", seqB); err != nil {
+		t.Fatalf("token at the floor must still sync, got %v", err)
+	}
+}
+
+func TestUpdateCalendarBothFieldsApplyAtomically(t *testing.T) {
+	st := openTest(t)
+	if _, err := st.CreateCalendarID("alice", "work", "Work", "#111111", ""); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// Both name and color change in one call — they must land together.
+	name, color := "Office", "#22ff22"
+	if err := st.UpdateCalendar("alice", "work", &name, &color); err != nil {
+		t.Fatalf("update both: %v", err)
+	}
+	find := func() *event.Calendar {
+		cals, _ := st.Calendars("alice")
+		for i := range cals {
+			if cals[i].ID == "work" {
+				return &cals[i]
+			}
+		}
+		return nil
+	}
+	if got := find(); got == nil || got.Name != "Office" || got.Color != "#22ff22" {
+		t.Fatalf("both fields should be updated together, got %+v", got)
+	}
+	// A no-op update (both nil) is accepted and changes nothing.
+	if err := st.UpdateCalendar("alice", "work", nil, nil); err != nil {
+		t.Fatalf("no-op update: %v", err)
+	}
+	if got := find(); got == nil || got.Name != "Office" || got.Color != "#22ff22" {
+		t.Fatalf("no-op update must not change fields, got %+v", got)
+	}
+}
+
+// TestConcurrentFirstAccessProvisionsExactlyOne hammers first-access auto-provisioning from the
+// unlocked read paths (Calendars, ListEvents) alongside a locked writer (PutEvent) for one brand-new
+// user. Provisioning must converge on exactly one 'personal' calendar with no error and no data race
+// (run under -race) — i.e. the write stays on the single writer, not a second, parallel path.
+func TestConcurrentFirstAccessProvisionsExactlyOne(t *testing.T) {
+	st := openTest(t)
+	start := time.Date(2026, 9, 1, 9, 0, 0, 0, time.UTC)
+	const g = 24
+	var wg sync.WaitGroup
+	errs := make(chan error, g*3)
+	for i := 0; i < g; i++ {
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			if _, err := st.Calendars("zoe"); err != nil {
+				errs <- err
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if _, err := st.ListEvents("zoe", "personal", start, start.Add(time.Hour)); err != nil {
+				errs <- err
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			ev := &event.Event{Summary: "e", Start: start, End: start.Add(time.Hour)}
+			if _, err := st.PutEvent("zoe", "personal", ev); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent first-access error: %v", err)
+	}
+	cals, err := st.Calendars("zoe")
+	if err != nil {
+		t.Fatalf("calendars: %v", err)
+	}
+	if len(cals) != 1 || cals[0].ID != "personal" {
+		t.Fatalf("expected exactly one 'personal' calendar after concurrent first access, got %+v", cals)
 	}
 }
