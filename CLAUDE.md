@@ -22,7 +22,7 @@ only** — never vendored or modified here.
 - Keep three things in sync: `permissions/<id>.json` ⇄ `internal/rights` ⇄ the UI right constant.
 - UI may import only `@holistic/ui` and `react` (holistic's `eslint.services.cjs` enforces it).
 - The daemon runs unprivileged and escalates nothing. Privileged work needs a narrow sudo
-  wrapper (see `sxty9/hostek`), not blanket sudo.
+  wrapper, not blanket sudo.
 
 ## Verify (from the repo root)
 

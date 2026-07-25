@@ -23,7 +23,7 @@ Browser ── https://holistic.local (Caddy, same-origin) ─┐
 
 ## Prerequisites
 
-The [holistic](https://github.com/sxty9/holistic) repo must be present **as a sibling**
+The **holistic** repo must be present **as a sibling**
 (`../holistic`) with the dashboard installed — it provides the `@holistic/ui` SDK and the SPA that
 bundles this plugin.
 
@@ -112,7 +112,7 @@ ui/                         @holistic/ui plugin (linked into holistic/frontend/e
 
 This service escalates nothing. If it must ever perform OS-level writes, follow the holistic
 pattern: a narrow `/usr/local/sbin` wrapper allow-listed in `sudoers.d`, invoked via `sudo -n`,
-with `NoNewPrivileges=false` in the unit (see `sxty9/hostek` for a worked example).
+with `NoNewPrivileges=false` in the unit.
 
 ## License
 
