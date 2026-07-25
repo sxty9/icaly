@@ -293,7 +293,7 @@ func (s *Store) Calendars(user string) ([]event.Calendar, error) {
 func (s *Store) CreateCalendar(user, name, color, tz string) (event.Calendar, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.ensureHome(user); err != nil {
+	if err := s.ensureHomeLocked(user); err != nil {
 		return event.Calendar{}, err
 	}
 	return s.createCalendar(user, genID(8), name, color, tz)
@@ -307,7 +307,7 @@ func (s *Store) CreateCalendarID(user, id, name, color, tz string) (event.Calend
 	if id == "" || safeName(id) != id {
 		return event.Calendar{}, errors.New("invalid calendar id")
 	}
-	if err := s.ensureHome(user); err != nil {
+	if err := s.ensureHomeLocked(user); err != nil {
 		return event.Calendar{}, err
 	}
 	if s.calOwned(user, id) {
@@ -324,20 +324,53 @@ func (s *Store) UpdateCalendar(user, id string, name, color *string) error {
 	if !s.calOwned(user, id) {
 		return ErrNotFound
 	}
+	if name == nil && color == nil {
+		return nil
+	}
+	// Apply the (possibly two) column writes in one transaction so a PROPPATCH that changes both
+	// name and color is atomic — a crash can never commit the new name while the old color survives.
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
 	if name != nil {
-		if _, err := s.db.Exec(`UPDATE calendars SET name=? WHERE owner=? AND id=?`, *name, user, id); err != nil {
+		if _, err := tx.Exec(`UPDATE calendars SET name=? WHERE owner=? AND id=?`, *name, user, id); err != nil {
+			_ = tx.Rollback()
 			return err
 		}
 	}
 	if color != nil {
-		if _, err := s.db.Exec(`UPDATE calendars SET color=? WHERE owner=? AND id=?`, *color, user, id); err != nil {
+		if _, err := tx.Exec(`UPDATE calendars SET color=? WHERE owner=? AND id=?`, *color, user, id); err != nil {
+			_ = tx.Rollback()
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
+// ensureHome auto-provisions the user's default "personal" calendar on first access. It is called
+// from the UNLOCKED read paths (Calendars, ListEvents), so the common already-provisioned case is a
+// lock-free COUNT; only the rare first-access provisioning takes the mutation lock, keeping the
+// actual write on the single-writer path (never a second, parallel write path) and atomic with any
+// concurrent mutation. Callers that ALREADY hold s.mu must use ensureHomeLocked (s.mu is non-reentrant).
 func (s *Store) ensureHome(user string) error {
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM calendars WHERE owner=?`, user).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil // already provisioned: no write, so no lock (the hot read path)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ensureHomeLocked(user)
+}
+
+// ensureHomeLocked provisions the default calendar; the caller must hold s.mu. It re-checks the
+// count under the lock (double-checked locking: a racing reader may have created it between our
+// unlocked COUNT and acquiring the lock), so first-access provisioning happens exactly once, on the
+// single writer, rather than as two concurrent inserts papered over by ON CONFLICT.
+func (s *Store) ensureHomeLocked(user string) error {
 	var n int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM calendars WHERE owner=?`, user).Scan(&n); err != nil {
 		return err
@@ -357,10 +390,11 @@ func (s *Store) createCalendar(user, id, name, color, tz string) (event.Calendar
 	if err := os.MkdirAll(filepath.Join(s.calDir(user, id), ".tmp"), 0o755); err != nil {
 		return event.Calendar{}, err
 	}
-	// ON CONFLICT DO NOTHING makes auto-provisioning idempotent: ensureHome runs from unlocked
-	// read paths, so two concurrent first-access reads can both reach here; the loser is a no-op
-	// rather than a unique-constraint error. CreateCalendar/CreateCalendarID never collide (random
-	// id, or an explicit pre-check), so this does not mask a real duplicate for them.
+	// ON CONFLICT DO NOTHING keeps calendar creation idempotent as a defensive backstop. Every
+	// caller now reaches here holding s.mu (ensureHomeLocked double-checks the count under the lock,
+	// and CreateCalendar/CreateCalendarID use a random id or an explicit pre-check), so this no
+	// longer masks a real race — it only guarantees a redundant create can never surface as a
+	// unique-constraint error.
 	_, err := s.db.Exec(`INSERT INTO calendars(id,owner,kind,name,description,color,timezone,ord,readonly,feed_token,public,ctag,created,updated)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(owner,id) DO NOTHING`,
 		id, user, "personal", name, "", color, tz, 0, 0, genID(24), 0, "0", now, now)
@@ -428,7 +462,7 @@ func (s *Store) CTag(user, calID string) (string, error) {
 func (s *Store) PutEvent(user, calID string, ev *event.Event) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.ensureHome(user); err != nil {
+	if err := s.ensureHomeLocked(user); err != nil {
 		return "", err
 	}
 	if !s.calOwned(user, calID) {
@@ -933,7 +967,7 @@ func (s *Store) EventMetas(user, calID string) ([]ObjectMeta, error) {
 func (s *Store) PutRaw(user, calID, uid string, raw []byte, ifMatch, ifNoneMatch string) (string, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.ensureHome(user); err != nil {
+	if err := s.ensureHomeLocked(user); err != nil {
 		return "", false, err
 	}
 	if !s.calOwned(user, calID) {
@@ -1093,27 +1127,48 @@ func (s *Store) Compact(before time.Time) error {
 	}
 	rows.Close()
 	for _, c := range cals {
-		var maxDel sql.NullInt64
-		if err := s.db.QueryRow(`SELECT MAX(seq) FROM changelog WHERE owner=? AND calendar_id=? AND at<?`,
-			c.owner, c.id, cutoff).Scan(&maxDel); err != nil {
-			return err
-		}
-		if !maxDel.Valid {
-			continue // nothing to trim for this calendar
-		}
-		if _, err := s.db.Exec(`DELETE FROM changelog WHERE owner=? AND calendar_id=? AND at<?`,
-			c.owner, c.id, cutoff); err != nil {
-			return err
-		}
-		floor := c.minValid
-		if maxDel.Int64 > floor {
-			floor = maxDel.Int64
-		}
-		if _, err := s.db.Exec(`UPDATE calendars SET min_valid_seq=? WHERE owner=? AND id=?`, floor, c.owner, c.id); err != nil {
+		if err := s.compactCalendar(c.owner, c.id, c.minValid, cutoff); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// compactCalendar trims one calendar's change-log below cutoff and advances its min_valid_seq to
+// the largest trimmed seq — both in ONE transaction. The atomicity is the point: a crash between
+// the DELETE and the floor bump would otherwise leave rows trimmed while min_valid_seq still admits
+// a sync-token whose changes are now gone, so SyncCollection would serve a silent gap instead of
+// the required 409 full-resync. The floor is derived from the seqs actually deleted (not the
+// timestamp order) and is monotonic (max with its prior value).
+func (s *Store) compactCalendar(owner, id string, minValid, cutoff int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	var maxDel sql.NullInt64
+	if err := tx.QueryRow(`SELECT MAX(seq) FROM changelog WHERE owner=? AND calendar_id=? AND at<?`,
+		owner, id, cutoff).Scan(&maxDel); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if !maxDel.Valid { // nothing to trim for this calendar
+		_ = tx.Rollback()
+		return nil
+	}
+	if _, err := tx.Exec(`DELETE FROM changelog WHERE owner=? AND calendar_id=? AND at<?`,
+		owner, id, cutoff); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	floor := minValid
+	if maxDel.Int64 > floor {
+		floor = maxDel.Int64
+	}
+	if _, err := tx.Exec(`UPDATE calendars SET min_valid_seq=? WHERE owner=? AND id=?`, floor, owner, id); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 // etagMatch reports whether an If-Match / If-None-Match header value satisfies the current strong
