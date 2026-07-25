@@ -31,6 +31,48 @@ func TestAutoProvisionDefaultCalendar(t *testing.T) {
 	}
 }
 
+func TestDeleteCalendar(t *testing.T) {
+	st := openTest(t)
+	cal, err := st.CreateCalendar("alice", "Work", "#f00", "")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	start := time.Date(2026, 6, 28, 9, 0, 0, 0, time.UTC)
+	if _, err := st.PutEvent("alice", cal.ID, &event.Event{Summary: "Standup", Start: start, End: start.Add(time.Hour)}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	dir := st.calDir("alice", cal.ID)
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("expected calendar dir to exist: %v", err)
+	}
+
+	if err := st.DeleteCalendar("alice", cal.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	// The calendar is gone from the listing, its events with it, and its directory is unlinked.
+	cals, err := st.Calendars("alice")
+	if err != nil {
+		t.Fatalf("calendars: %v", err)
+	}
+	for _, c := range cals {
+		if c.ID == cal.ID {
+			t.Fatalf("deleted calendar still listed: %+v", cals)
+		}
+	}
+	if _, _, err := st.GetEvent("alice", cal.ID, "any"); err != ErrNotFound {
+		t.Fatalf("expected events gone, got %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("expected calendar dir removed, stat err=%v", err)
+	}
+
+	// Deleting an unknown calendar is ErrNotFound.
+	if err := st.DeleteCalendar("alice", "nope"); err != ErrNotFound {
+		t.Fatalf("expected ErrNotFound for unknown calendar, got %v", err)
+	}
+}
+
 func TestEventCRUDAndChangeLog(t *testing.T) {
 	st := openTest(t)
 	start := time.Date(2026, 6, 28, 9, 0, 0, 0, time.UTC)

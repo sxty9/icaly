@@ -22,10 +22,13 @@ import (
 	"icaly/internal/api"
 	"icaly/internal/apppass"
 	"icaly/internal/auth"
+	"icaly/internal/contax"
 	"icaly/internal/geocode"
 	"icaly/internal/imip"
 	"icaly/internal/instance"
+	"icaly/internal/notify"
 	"icaly/internal/push"
+	"icaly/internal/reminder"
 	"icaly/internal/scheduling"
 	"icaly/internal/store"
 )
@@ -71,8 +74,18 @@ func main() {
 	}
 	geo := geocode.New(getenv("ICALY_GEOCODE_PROVIDER", ""), readSecret("ICALY_GEOCODE_KEY", "ICALY_GEOCODE_KEY_FILE"), geoCap)
 
+	// Reminders (VALARMs) are fired into the holistic notification service (notifyd). The shared
+	// notify secret is group-readable (holistic group), which icaly already belongs to. Absent
+	// URL/secret ⇒ the scheduler disables itself and reminders are simply not delivered.
+	notifier := notify.New(getenv("ICALY_NOTIFY_URL", "http://127.0.0.1:8778"), readSecret("ICALY_NOTIFY_SECRET", "ICALY_NOTIFY_SECRET_FILE"))
+	reminders := reminder.New(st, notifier)
+
+	// contax personal-group membership for calendar sharing: live-resolves contax-group grants
+	// (cached per group). Absent URL/secret ⇒ contax-group shares stay inert (holistic/ad-hoc work).
+	contaxClient := contax.New(getenv("ICALY_CONTAX_URL", "http://127.0.0.1:8777"), readSecret("ICALY_CONTAX_SECRET", "ICALY_CONTAX_SECRET_FILE"))
+
 	srv := &http.Server{
-		Handler:           api.New(v, st, inst, hub, sched, ap, geo, mailSecret).Handler(),
+		Handler:           api.New(v, st, inst, hub, sched, ap, geo, mailSecret, contaxClient, notifier).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -95,6 +108,9 @@ func main() {
 	// WebDAV-Sync tokens are eventually rejected with 409 + full resync (plan M2). 90-day
 	// retention per the plan; tombstones older than that are dropped.
 	go compactionLoop(ctx, st)
+
+	// Fire due VALARMs into the notification service on a fixed tick.
+	go reminders.Run(ctx)
 
 	<-ctx.Done()
 

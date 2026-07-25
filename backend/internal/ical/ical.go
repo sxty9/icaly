@@ -616,6 +616,11 @@ func toComponent(ev *event.Event) *goical.Component {
 		}
 		va.Props.SetText(goical.PropAction, action)
 		setRaw(va.Props, goical.PropTrigger, al.Trigger)
+		if strings.EqualFold(al.Related, "END") {
+			if tp := va.Props.Get(goical.PropTrigger); tp != nil {
+				tp.Params.Set(goical.ParamRelated, "END")
+			}
+		}
 		desc := al.Description
 		if desc == "" {
 			desc = ev.Summary
@@ -730,9 +735,14 @@ func fromComponent(c *goical.Component) *event.Event {
 	}
 	for _, child := range c.Children {
 		if child.Name == goical.CompAlarm {
+			related := ""
+			if tp := child.Props.Get(goical.PropTrigger); tp != nil {
+				related = strings.ToUpper(tp.Params.Get(goical.ParamRelated))
+			}
 			ev.Alarms = append(ev.Alarms, event.Alarm{
 				Action:      text(child, goical.PropAction),
 				Trigger:     raw(child, goical.PropTrigger),
+				Related:     related,
 				Description: text(child, goical.PropDescription),
 			})
 		}

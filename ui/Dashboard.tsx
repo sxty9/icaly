@@ -1,11 +1,12 @@
 // Dashboard is icaly's plugin root. It renders a live calendar (month / week / agenda) over the
-// caller's calendars, gated by the hp_icaly_* rights, and hosts the event editor, the subscribe/
-// share panel and calendar creation. Live updates come from useLiveEvents (SSE + polling).
+// caller's calendars, gated by the hp_icaly_* rights, and hosts the event editor, the per-calendar
+// settings surface (CalendarSettings) and calendar creation. Live updates come from useLiveEvents
+// (SSE + polling).
 //
 // Rights (keep in sync with permissions/icaly.json and backend internal/rights):
 //   hp_icaly_view  — see calendars/events, subscribe, export
 //   hp_icaly_edit  — create/update/delete events, import
-//   hp_icaly_share — create calendars
+//   hp_icaly_share — create/rename/delete calendars, sharing & app passwords
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Badge,
@@ -22,6 +23,7 @@ import {
   Panel,
   PlusIcon,
   SegmentedControl,
+  SettingsIcon,
   Spinner,
   Stack,
   Text,
@@ -29,6 +31,7 @@ import {
   useLiveQuery,
   userHasRight,
   type ContactOption,
+  type MenuItem,
   type ServiceContextProps,
 } from '@holistic/ui';
 import type { Calendar, CalendarsResp, CalEvent, ViewMode } from './types';
@@ -38,7 +41,7 @@ import { MonthView } from './MonthView';
 import { WeekView } from './WeekView';
 import { AgendaView } from './AgendaView';
 import { EventEditor } from './EventEditor';
-import { SubscribePanel } from './SubscribePanel';
+import { CalendarSettings } from './CalendarSettings';
 
 const VIEW = 'hp_icaly_view';
 const EDIT = 'hp_icaly_edit';
@@ -55,13 +58,74 @@ interface EditorState {
   defaultStart?: Date;
 }
 
+// A calendar's stable identity across owners: shared calendars keep their owner's id (which can
+// collide with the caller's own), so the composite (owner, id) is the real key.
+const calKey = (c: { owner: string; id: string }) => `${c.owner}|${c.id}`;
+
+// The calendar dropdown: own calendars first, then any shared to the caller (under a separator,
+// labelled with who shared them), then the create action.
+function calendarMenuItems(
+  calendars: Calendar[],
+  selectedKey: string,
+  onSelect: (key: string) => void,
+  canShare: boolean,
+  onNew: () => void,
+): MenuItem[] {
+  const own = calendars.filter((c) => !c.sharedBy);
+  const shared = calendars.filter((c) => c.sharedBy);
+  const items: MenuItem[] = own.map((c) => ({
+    id: calKey(c),
+    label: c.name,
+    checked: calKey(c) === selectedKey,
+    onSelect: () => onSelect(calKey(c)),
+  }));
+  shared.forEach((c, i) =>
+    items.push({
+      id: calKey(c),
+      label: `${c.name} · ${c.sharedBy}`,
+      checked: calKey(c) === selectedKey,
+      separatorBefore: i === 0,
+      onSelect: () => onSelect(calKey(c)),
+    }),
+  );
+  if (canShare) {
+    items.push({ id: '__new', label: 'New calendar…', separatorBefore: true, icon: <PlusIcon />, onSelect: onNew });
+  }
+  return items;
+}
+
 export function Dashboard({ user, api, apiFor, ui, nav }: ServiceContextProps) {
   // Contact directory for the attendee fields: contax resolves who this user may address, so an
   // event can invite people by name/nickname (with an avatar) instead of a bare email.
   const searchContacts = useCallback(
     async (q: string): Promise<ContactOption[]> => {
       try {
-        const res = await apiFor('contax').get<{ contacts: ContactOption[] }>(`lookup?q=${encodeURIComponent(q)}`);
+        const res = await apiFor('contax').get<{
+          contacts: ContactOption[];
+          groups?: { id: string; name: string; memberCount: number }[];
+        }>(`lookup?q=${encodeURIComponent(q)}&includeGroups=1`);
+        // Personal groups first (they expand into member addresses on select), then contacts.
+        const groups: ContactOption[] = (res.groups ?? []).map((g) => ({
+          email: '',
+          displayName: g.name,
+          kind: 'group' as const,
+          groupId: g.id,
+          memberCount: g.memberCount,
+        }));
+        return [...groups, ...(res.contacts ?? [])];
+      } catch {
+        return [];
+      }
+    },
+    [apiFor],
+  );
+  // Expand a chosen contax group into its member contacts (the picker merges the addresses in).
+  const expandGroup = useCallback(
+    async (groupId: string): Promise<ContactOption[]> => {
+      try {
+        const res = await apiFor('contax').get<{ contacts: ContactOption[] }>(
+          `groups/${encodeURIComponent(groupId)}/members`,
+        );
         return res.contacts ?? [];
       } catch {
         return [];
@@ -76,20 +140,24 @@ export function Dashboard({ user, api, apiFor, ui, nav }: ServiceContextProps) {
   const calsQ = useLiveQuery<CalendarsResp>(() => api.get<CalendarsResp>('calendars'), 30000, [canView]);
   const calendars: Calendar[] = calsQ.data?.calendars ?? [];
 
-  const [selectedId, setSelectedId] = useState('');
+  // A calendar is identified by (owner, id): a calendar shared to you keeps its owner's id, which
+  // can collide with your own (both "personal"), so selection is keyed on the composite.
+  const [selectedKey, setSelectedKey] = useState('');
   const [view, setView] = useState<ViewMode>('month');
   const [anchor, setAnchor] = useState<Date>(() => new Date());
   const [editor, setEditor] = useState<EditorState | null>(null);
-  const [subscribeOpen, setSubscribeOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
 
   // Default to the first calendar once they load (or keep a still-present selection).
   useEffect(() => {
     if (calendars.length === 0) return;
-    if (!calendars.some((c) => c.id === selectedId)) setSelectedId(calendars[0].id);
-  }, [calendars, selectedId]);
+    if (!calendars.some((c) => calKey(c) === selectedKey)) setSelectedKey(calKey(calendars[0]));
+  }, [calendars, selectedKey]);
 
-  const selected = calendars.find((c) => c.id === selectedId);
+  const selected = calendars.find((c) => calKey(c) === selectedKey);
+  const selectedShared = !!selected?.sharedBy;
+  const canEditSelected = canEdit && !!selected && !selected.readOnly;
 
   useEffect(() => {
     nav.setTitle(selected ? `Calendar — ${selected.name}` : 'Calendar');
@@ -109,7 +177,7 @@ export function Dashboard({ user, api, apiFor, ui, nav }: ServiceContextProps) {
     return { rangeStart: s, rangeEnd: addDays(s, 30) };
   }, [view, anchor]);
 
-  const live = useLiveEvents(api, selectedId || 'personal', rangeStart, rangeEnd);
+  const live = useLiveEvents(api, selected?.owner || user.username, selected?.id || 'personal', rangeStart, rangeEnd);
 
   if (!canView) {
     return (
@@ -129,7 +197,7 @@ export function Dashboard({ user, api, apiFor, ui, nav }: ServiceContextProps) {
   }
 
   function openNew(day?: Date) {
-    if (!canEdit) return;
+    if (!canEditSelected) return;
     setEditor({ event: null, defaultStart: day });
   }
 
@@ -153,6 +221,9 @@ export function Dashboard({ user, api, apiFor, ui, nav }: ServiceContextProps) {
             {label}
           </Text>
           <LiveBadge live={live.live} />
+          {selectedShared && (
+            <Badge variant="neutral">{selected?.readOnly ? 'Geteilt · nur Ansehen' : 'Geteilt'}</Badge>
+          )}
         </Stack>
 
         <Stack direction="row" align="center" gap={2} wrap>
@@ -160,17 +231,15 @@ export function Dashboard({ user, api, apiFor, ui, nav }: ServiceContextProps) {
           {calendars.length > 0 && (
             <DropdownMenu
               trigger={<Button variant="secondary">{selected?.name ?? 'Calendar'}</Button>}
-              items={[
-                ...calendars.map((c) => ({ id: c.id, label: c.name, checked: c.id === selectedId, onSelect: () => setSelectedId(c.id) })),
-                ...(canShare ? [{ id: '__new', label: 'New calendar…', separatorBefore: true, icon: <PlusIcon />, onSelect: () => setCreateOpen(true) }] : []),
-              ]}
+              items={calendarMenuItems(calendars, selectedKey, setSelectedKey, canShare, () => setCreateOpen(true))}
             />
           )}
-          <Button variant="secondary" onClick={() => setSubscribeOpen(true)} disabled={!selected}>
-            Subscribe
-          </Button>
+          {/* Settings/sharing is owner-only: a calendar shared TO you is not yours to configure. */}
+          <IconButton label="Calendar settings" variant="secondary" onClick={() => setSettingsOpen(true)} disabled={!selected || selectedShared}>
+            <SettingsIcon />
+          </IconButton>
           {canEdit && (
-            <Button variant="primary" iconLeft={<PlusIcon />} onClick={() => openNew()}>
+            <Button variant="primary" iconLeft={<PlusIcon />} onClick={() => openNew()} disabled={!canEditSelected}>
               New event
             </Button>
           )}
@@ -208,26 +277,36 @@ export function Dashboard({ user, api, apiFor, ui, nav }: ServiceContextProps) {
         <EventEditor
           api={api}
           ui={ui}
-          calendarId={selectedId}
+          calendarId={selected.id}
+          owner={selected.owner}
           event={editor.event}
           defaultStart={editor.defaultStart}
-          canEdit={canEdit}
+          canEdit={canEditSelected}
           selfEmail={calsQ.data?.address ?? ''}
           searchContacts={searchContacts}
+          onExpandGroup={expandGroup}
           onClose={() => setEditor(null)}
           onSaved={live.refresh}
         />
       )}
-      {subscribeOpen && selected && (
-        <SubscribePanel
+      {settingsOpen && selected && !selectedShared && (
+        <CalendarSettings
           api={api}
+          apiFor={apiFor}
           ui={ui}
           calendar={selected}
           canImport={canEdit}
           canShare={canShare}
           username={user.username}
-          onChanged={live.refresh}
-          onClose={() => setSubscribeOpen(false)}
+          onEventsChanged={live.refresh}
+          onCalendarsChanged={calsQ.refresh}
+          onDeleted={() => {
+            const next = calendars.find((c) => calKey(c) !== calKey(selected));
+            setSelectedKey(next ? calKey(next) : '');
+            calsQ.refresh();
+            setSettingsOpen(false);
+          }}
+          onClose={() => setSettingsOpen(false)}
         />
       )}
       {createOpen && (
@@ -237,7 +316,7 @@ export function Dashboard({ user, api, apiFor, ui, nav }: ServiceContextProps) {
           onClose={() => setCreateOpen(false)}
           onCreated={(id) => {
             calsQ.refresh();
-            setSelectedId(id);
+            setSelectedKey(calKey({ owner: user.username, id }));
           }}
         />
       )}

@@ -75,6 +75,26 @@ export interface Calendar {
   public: boolean;
   ctag: string;
   feedToken?: string;
+  sharedBy?: string; // set when this calendar is shared TO the caller by another user (its owner)
+}
+
+// A sharing grant on a calendar: view/edit access for a Holistic group, a contax personal group, or
+// an ad-hoc member set. publicExt records the owner consented to expose the read-only feed link so
+// external (non-account) contacts can subscribe.
+export interface Grant {
+  id: string;
+  kind: 'holistic' | 'contax' | 'adhoc';
+  ref: string; // holistic: OS group name; contax: grp-id; adhoc: ""
+  label: string;
+  level: 'view' | 'edit';
+  publicExt: boolean;
+  members?: string[]; // ad-hoc: internal usernames
+  created: string;
+}
+
+export interface GrantsResp {
+  calendar: string;
+  grants: Grant[];
 }
 
 export interface CalendarsResp {

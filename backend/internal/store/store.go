@@ -34,7 +34,7 @@ var ErrNotFound = errors.New("not found")
 // SSE clients via the change-log. Seq is the monotonic change-log id.
 type Change struct {
 	Seq        int64     `json:"seq"`
-	Owner      string    `json:"-"`
+	Owner      string    `json:"owner"`
 	CalendarID string    `json:"calendar"`
 	UID        string    `json:"uid"`
 	Type       string    `json:"type"` // put | delete
@@ -85,6 +85,24 @@ CREATE TABLE IF NOT EXISTS changelog(
   at          INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS changelog_cal ON changelog(owner, calendar_id, seq);
+CREATE TABLE IF NOT EXISTS cal_grants(
+  id          TEXT PRIMARY KEY,
+  owner       TEXT NOT NULL,             -- calendar owner (the sharer)
+  cal_id      TEXT NOT NULL,             -- calendar id within owner
+  kind        TEXT NOT NULL,             -- 'holistic' | 'contax' | 'adhoc'
+  ref         TEXT NOT NULL DEFAULT '',  -- holistic: OS group name; contax: grp-id; adhoc: ''
+  label       TEXT NOT NULL DEFAULT '',  -- display label (group name / ad-hoc set name)
+  level       TEXT NOT NULL,             -- 'view' | 'edit'
+  public_ext  INTEGER NOT NULL DEFAULT 0,-- external-consent: owner's feed link exposed to reach externals
+  created     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS cal_grants_cal ON cal_grants(owner, cal_id);
+CREATE INDEX IF NOT EXISTS cal_grants_kind_ref ON cal_grants(kind, ref);
+CREATE TABLE IF NOT EXISTS cal_grant_members(
+  grant_id    TEXT NOT NULL,             -- FK cal_grants.id (ad-hoc member sets only)
+  username    TEXT NOT NULL,             -- holistic account (internal members)
+  PRIMARY KEY(grant_id, username)
+);
 `
 
 // Store owns the data root and the derived SQLite index.
@@ -346,6 +364,40 @@ func (s *Store) createCalendar(user, id, name, color, tz string) (event.Calendar
 		return event.Calendar{}, err
 	}
 	return event.Calendar{ID: id, Owner: user, Kind: "personal", Name: name, Color: color, TimeZone: tz, CTag: "0"}, nil
+}
+
+// DeleteCalendar removes a calendar and everything derived from it: its event index rows, its
+// change-log, its calendar row and — last — the on-disk .ics directory. The DB rows go first, in
+// one transaction, so a crash before the directory is unlinked leaves only orphaned .ics bytes
+// with no calendar row (reconcile only walks known calendars, so it ignores them) rather than
+// index rows pointing at vanished files. Returns ErrNotFound for a calendar the user does not own.
+func (s *Store) DeleteCalendar(user, calID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.calOwned(user, calID) {
+		return ErrNotFound
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	for _, q := range []string{
+		`DELETE FROM events WHERE owner=? AND calendar_id=?`,
+		`DELETE FROM changelog WHERE owner=? AND calendar_id=?`,
+		`DELETE FROM cal_grant_members WHERE grant_id IN (SELECT id FROM cal_grants WHERE owner=? AND cal_id=?)`,
+		`DELETE FROM cal_grants WHERE owner=? AND cal_id=?`,
+		`DELETE FROM calendars WHERE owner=? AND id=?`,
+	} {
+		if _, err := tx.Exec(q, user, calID); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	_ = os.RemoveAll(s.calDir(user, calID))
+	return nil
 }
 
 func (s *Store) calOwned(user, calID string) bool {

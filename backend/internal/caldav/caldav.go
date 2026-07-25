@@ -45,14 +45,16 @@ type Handler struct {
 	st        *store.Store
 	base      string
 	addressOf func(user string) string
+	gc        store.GroupChecker // live contax-group membership for shared-calendar access (may be nil)
 }
 
-// New builds a Handler. base must end in a slash.
-func New(st *store.Store, base string, addressOf func(string) string) *Handler {
+// New builds a Handler. base must end in a slash. gc resolves live contax-group membership for
+// shared-calendar access (nil ⇒ contax-group shares are inert over CalDAV, like in the JSON API).
+func New(st *store.Store, base string, addressOf func(string) string, gc store.GroupChecker) *Handler {
 	if !strings.HasSuffix(base, "/") {
 		base += "/"
 	}
-	return &Handler{st: st, base: base, addressOf: addressOf}
+	return &Handler{st: st, base: base, addressOf: addressOf, gc: gc}
 }
 
 // resource kinds in the DAV tree.
@@ -72,47 +74,62 @@ type resource struct {
 	object string // resource name without the .ics suffix (the store key)
 }
 
-// Serve dispatches one DAV request for the already-authenticated principal. canEdit gates the
-// mutating verbs; isAdmin lets an admin act on another user's tree (Schicht-2 bypass).
-func (h *Handler) Serve(w http.ResponseWriter, r *http.Request, authUser string, isAdmin, canEdit bool) {
+// Serve dispatches one DAV request for the already-authenticated principal. canEdit is the caller's
+// GLOBAL edit right; isAdmin lets an admin act on another user's tree. groups are the caller's live
+// OS groups, used to resolve access to calendars SHARED to them (ACL): a grantee may read a shared
+// collection (any level) and write it only with an edit-level grant AND the global edit right.
+func (h *Handler) Serve(w http.ResponseWriter, r *http.Request, authUser string, groups []string, isAdmin, canEdit bool) {
 	rel := strings.TrimPrefix(r.URL.Path, h.base)
 	res := parsePath(rel)
 
-	// Path-scoping: a principal may only act within their own tree unless they are admin.
-	if res.user != "" && res.user != authUser && !isAdmin {
-		http.Error(w, "Forbidden", http.StatusForbidden)
-		return
+	// Path-scoping. A principal always reaches their own tree (and admins reach anyone's). For
+	// ANOTHER user's tree the only reachable nodes are specific calendars shared to the caller: the
+	// whole-home listing stays private (you discover shared calendars via your OWN home, C2), and a
+	// specific collection/object needs a grant. writable additionally requires an edit-level grant.
+	own := res.user == "" || res.user == authUser || isAdmin
+	writable := canEdit && own
+	if !own {
+		if res.kind == resHome || res.cal == "" {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		lvl := h.st.AccessLevel(authUser, groups, isAdmin, res.user, res.cal, h.gc)
+		if lvl == store.AccessNone {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		writable = canEdit && lvl == store.AccessEdit
 	}
 
 	switch r.Method {
 	case "OPTIONS":
 		h.options(w)
 	case "PROPFIND":
-		h.propfind(w, r, res, authUser)
+		h.propfind(w, r, res, authUser, groups, isAdmin)
 	case "REPORT":
 		h.report(w, r, res)
 	case "GET", "HEAD":
 		h.get(w, r, res)
 	case "PUT":
-		if !canEdit {
+		if !writable {
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
 		h.put(w, r, res)
 	case "DELETE":
-		if !canEdit {
+		if !writable {
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
 		h.del(w, r, res)
 	case "MKCALENDAR":
-		if !canEdit {
+		if !writable {
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
 		h.mkcalendar(w, r, res)
 	case "PROPPATCH":
-		if !canEdit {
+		if !writable {
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
@@ -160,7 +177,7 @@ func (h *Handler) options(w http.ResponseWriter) {
 
 // ── PROPFIND ────────────────────────────────────────────────────────────────────────
 
-func (h *Handler) propfind(w http.ResponseWriter, r *http.Request, res resource, authUser string) {
+func (h *Handler) propfind(w http.ResponseWriter, r *http.Request, res resource, authUser string, groups []string, isAdmin bool) {
 	body, _ := io.ReadAll(io.LimitReader(r.Body, maxDav))
 	names, allprop := parsePropfind(body)
 	d := depth(r)
@@ -176,7 +193,21 @@ func (h *Handler) propfind(w http.ResponseWriter, r *http.Request, res resource,
 		if d >= 1 {
 			cals, _ := h.st.Calendars(res.user)
 			for _, c := range cals {
-				responses = append(responses, h.collectionResponse(res.user, c, names, allprop))
+				responses = append(responses, h.collectionResponse(authUser, res.user, c, c.ReadOnly, names, allprop))
+			}
+			// Discovery: in the caller's OWN home, also list calendars shared TO them as child
+			// collections whose href points at the real owner's path (C2). parsePath maps that href
+			// back to the owner, so subsequent requests route to the owner's data under the relaxed
+			// guard. Cross-principal hrefs are followed by most clients; not an Apple sharing-invite.
+			if res.user == authUser {
+				if shared, err := h.st.CalendarsFor(authUser, groups, h.gc); err == nil {
+					for _, sc := range shared {
+						if sc.SharedBy == "" {
+							continue // own calendars already listed
+						}
+						responses = append(responses, h.collectionResponse(authUser, sc.Owner, sc.Calendar, sc.ReadOnly, names, allprop))
+					}
+				}
 			}
 		}
 	case resCollection:
@@ -185,7 +216,11 @@ func (h *Handler) propfind(w http.ResponseWriter, r *http.Request, res resource,
 			http.Error(w, "Not Found", http.StatusNotFound)
 			return
 		}
-		responses = append(responses, h.collectionResponse(res.user, cal, names, allprop))
+		readOnly := cal.ReadOnly
+		if res.user != authUser && !isAdmin {
+			readOnly = h.st.AccessLevel(authUser, groups, isAdmin, res.user, res.cal, h.gc) == store.AccessView
+		}
+		responses = append(responses, h.collectionResponse(authUser, res.user, cal, readOnly, names, allprop))
 		if d >= 1 {
 			metas, _ := h.st.EventMetas(res.user, res.cal)
 			for _, m := range metas {
@@ -246,10 +281,14 @@ func (h *Handler) homeResponse(user string, names []xml.Name, allprop bool) stri
 	return renderResponse(h.calendarHome(user), ok, missing, "")
 }
 
-func (h *Handler) collectionResponse(user string, c event.Calendar, names []xml.Name, allprop bool) string {
+// collectionResponse renders a calendar collection. currentUser is the accessor (current-user-
+// principal); owner is the calendar's real owner (the href lives under the owner's path, so a
+// calendar shared to currentUser is addressed at the owner's collection). readOnly drives the
+// advertised privilege set — for a view-level share, strict clients then render it read-only.
+func (h *Handler) collectionResponse(currentUser, owner string, c event.Calendar, readOnly bool, names []xml.Name, allprop bool) string {
 	ctagNum, _ := strconv.ParseInt(c.CTag, 10, 64)
 	priv := "<D:privilege><D:read/></D:privilege>"
-	if !c.ReadOnly {
+	if !readOnly {
 		priv += "<D:privilege><D:write/></D:privilege><D:privilege><D:write-content/></D:privilege>" +
 			"<D:privilege><D:bind/></D:privilege><D:privilege><D:unbind/></D:privilege>"
 	}
@@ -262,8 +301,8 @@ func (h *Handler) collectionResponse(user string, c event.Calendar, names []xml.
 		{cdav("supported-calendar-component-set"), `<C:comp name="VEVENT"/>`},
 		{csrv("getctag"), esc(c.CTag)},
 		{dav("sync-token"), esc(h.syncToken(ctagNum))},
-		{dav("owner"), h.hrefElem(h.principalPath(c.Owner))},
-		{dav("current-user-principal"), h.hrefElem(h.principalPath(user))},
+		{dav("owner"), h.hrefElem(h.principalPath(owner))},
+		{dav("current-user-principal"), h.hrefElem(h.principalPath(currentUser))},
 		{dav("supported-report-set"), reports},
 		{dav("current-user-privilege-set"), priv},
 	}
@@ -271,7 +310,7 @@ func (h *Handler) collectionResponse(user string, c event.Calendar, names []xml.
 		supported = append(supported, kv{apple("calendar-color"), esc(c.Color)})
 	}
 	ok, missing := buildPropstats(supported, names, allprop)
-	return renderResponse(h.collectionPath(user, c.ID), ok, missing, "")
+	return renderResponse(h.collectionPath(owner, c.ID), ok, missing, "")
 }
 
 // objectResponse renders an object's props, reading the verbatim bytes only if calendar-data or

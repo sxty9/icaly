@@ -36,6 +36,17 @@ func New(st *store.Store, inst *instance.Resolver, mailer Mailer) *Scheduler {
 	return &Scheduler{st: st, inst: inst, mailer: mailer}
 }
 
+// SendPlain sends a plain (non-iTIP) email on behalf of a local user through the mailer. Calendar
+// sharing uses it to email external recipients a subscription link. Returns imip.ErrDisabled when
+// no transport is configured (the caller treats that as best-effort). Callers must enforce the
+// external-invite rights (hp_icaly_invite + hp_mail_send) before calling.
+func (s *Scheduler) SendPlain(fromUser string, to []string, subject, body string) error {
+	if s.mailer == nil || !s.mailer.Enabled() {
+		return imip.ErrDisabled
+	}
+	return s.mailer.Send(imip.SendInput{FromUser: fromUser, To: to, Subject: subject, Body: body})
+}
+
 // Outcome summarises what an organizer save dispatched.
 type Outcome struct {
 	InternalDelivered int `json:"internalDelivered"`

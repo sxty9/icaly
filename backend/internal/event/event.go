@@ -21,10 +21,12 @@ type Participant struct {
 	Username   string `json:"username,omitempty"`
 }
 
-// Alarm is a reminder (VALARM). Trigger is an iCalendar duration relative to start, e.g. "-PT15M".
+// Alarm is a reminder (VALARM). Trigger is an iCalendar duration; Related says whether it is
+// relative to the event START (default) or END (RFC 5545 TRIGGER;RELATED=END).
 type Alarm struct {
-	Action      string `json:"action"`  // DISPLAY | EMAIL
-	Trigger     string `json:"trigger"` // e.g. -PT15M
+	Action      string `json:"action"`            // DISPLAY | EMAIL
+	Trigger     string `json:"trigger"`           // e.g. -PT15M
+	Related     string `json:"related,omitempty"` // "" (START) | "END"
 	Description string `json:"description,omitempty"`
 }
 

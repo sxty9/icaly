@@ -18,7 +18,7 @@ func newTestHandler(t *testing.T) (*Handler, *store.Store) {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	return New(st, davBase, func(u string) string { return u + "@test.local" }), st
+	return New(st, davBase, func(u string) string { return u + "@test.local" }, nil), st
 }
 
 // serve runs one DAV request as principal "alice" (admin=false, canEdit=true) and returns the
@@ -29,7 +29,7 @@ func serve(h *Handler, method, path, body string, headers map[string]string) *ht
 		r.Header.Set(k, v)
 	}
 	w := httptest.NewRecorder()
-	h.Serve(w, r, "alice", false, true)
+	h.Serve(w, r, "alice", nil, false, true)
 	return w
 }
 
@@ -300,9 +300,62 @@ func TestMkcalendarAndScoping(t *testing.T) {
 	// A principal may not act inside another user's tree (Schicht-2 path scoping).
 	r := httptest.NewRequest("PROPFIND", davBase+"calendars/bob/", strings.NewReader(""))
 	rr := httptest.NewRecorder()
-	h.Serve(rr, r, "alice", false, true) // alice, not admin, asking for bob/
+	h.Serve(rr, r, "alice", nil, false, true) // alice, not admin, asking for bob's home (no grant)
 	if rr.Code != 403 {
 		t.Fatalf("cross-user access should be 403, got %d", rr.Code)
+	}
+}
+
+func TestSharedCalendarAccess(t *testing.T) {
+	h, st := newTestHandler(t)
+	bcal, err := st.CreateCalendar("bob", "Bobcal", "", "")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	base := davBase + "calendars/bob/" + bcal.ID + "/"
+
+	serveAs := func(user, method, path, body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, path, strings.NewReader(body))
+		if method == "PUT" {
+			r.Header.Set("Content-Type", "text/calendar")
+		}
+		w := httptest.NewRecorder()
+		h.Serve(w, r, user, nil, false, true)
+		return w
+	}
+
+	// No grant: carol cannot see bob's calendar.
+	if w := serveAs("carol", "PROPFIND", base, ""); w.Code != 403 {
+		t.Fatalf("no-grant access should be 403, got %d", w.Code)
+	}
+
+	// View grant: alice can PROPFIND but not PUT.
+	g, err := st.AddGrant("bob", bcal.ID, "adhoc", "", "Buddies", "view", false, []string{"alice"})
+	if err != nil {
+		t.Fatalf("addgrant: %v", err)
+	}
+	if w := serveAs("alice", "PROPFIND", base, ""); w.Code != 207 {
+		t.Fatalf("view-shared PROPFIND expected 207, got %d", w.Code)
+	}
+	if w := serveAs("alice", "PUT", base+"evt1.ics", evt1); w.Code != 403 {
+		t.Fatalf("view-shared PUT should be 403, got %d", w.Code)
+	}
+
+	// Bump to edit: alice can now PUT into bob's calendar.
+	if err := st.SetGrant("bob", bcal.ID, g.ID, "edit", false, nil); err != nil {
+		t.Fatalf("setgrant: %v", err)
+	}
+	if w := serveAs("alice", "PUT", base+"evt1.ics", evt1); w.Code != 201 && w.Code != 204 {
+		t.Fatalf("edit-shared PUT expected 201/204, got %d", w.Code)
+	}
+	// The event landed in bob's calendar.
+	if _, _, err := st.GetEvent("bob", bcal.ID, "evt1"); err != nil {
+		t.Fatalf("event should be stored in bob's calendar: %v", err)
+	}
+
+	// A grantee still cannot browse bob's whole home (only the shared collection).
+	if w := serveAs("alice", "PROPFIND", davBase+"calendars/bob/", ""); w.Code != 403 {
+		t.Fatalf("grantee browsing owner home should be 403, got %d", w.Code)
 	}
 }
 

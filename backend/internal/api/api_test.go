@@ -75,7 +75,7 @@ func newHarness(t *testing.T) *harness {
 	sched := scheduling.New(st, inst, imip.New("", "")) // mailer disabled in tests
 	ap := apppass.New(t.TempDir())
 	geo := geocode.NewWith(fakeGeo{})
-	srv := httptest.NewServer(New(v, st, inst, hub, sched, ap, geo, "test-inbound-secret").Handler())
+	srv := httptest.NewServer(New(v, st, inst, hub, sched, ap, geo, "test-inbound-secret", nil, nil).Handler())
 	t.Cleanup(srv.Close)
 
 	claims := jwt.MapClaims{"sub": cur.Username, "type": "access", "exp": time.Now().Add(time.Hour).Unix()}

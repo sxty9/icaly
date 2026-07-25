@@ -19,11 +19,11 @@ func recv(t *testing.T, ch <-chan store.Change) store.Change {
 }
 
 func TestHubFanout(t *testing.T) {
-	h := &Hub{subs: make(map[string]map[chan store.Change]struct{})}
+	h := &Hub{subs: make(map[string]map[*sub]struct{})}
 
-	a1, cancelA1 := h.Subscribe("alice")
-	a2, cancelA2 := h.Subscribe("alice")
-	b1, cancelB1 := h.Subscribe("bob")
+	a1, cancelA1 := h.Subscribe("alice", nil)
+	a2, cancelA2 := h.Subscribe("alice", nil)
+	b1, cancelB1 := h.Subscribe("bob", nil)
 	defer cancelB1()
 
 	// A change for alice reaches both of her subscribers, not bob's.
@@ -50,8 +50,8 @@ func TestHubFanout(t *testing.T) {
 }
 
 func TestPublishDropsOnFullChannel(t *testing.T) {
-	h := &Hub{subs: make(map[string]map[chan store.Change]struct{})}
-	_, cancel := h.Subscribe("alice")
+	h := &Hub{subs: make(map[string]map[*sub]struct{})}
+	_, cancel := h.Subscribe("alice", nil)
 	defer cancel()
 	// Overflow the 64-deep buffer; Publish must never block.
 	done := make(chan struct{})
@@ -65,5 +65,25 @@ func TestPublishDropsOnFullChannel(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("Publish blocked on a full subscriber channel")
+	}
+}
+
+func TestShareFanout(t *testing.T) {
+	h := &Hub{subs: make(map[string]map[*sub]struct{})}
+	// bob is a grantee of alice's "work" calendar only.
+	bob, cancel := h.Subscribe("bob", map[string]bool{AccessKey("alice", "work"): true})
+	defer cancel()
+
+	// A change to alice/work reaches bob (fan-out to the grantee).
+	h.Publish(store.Change{Seq: 1, Owner: "alice", CalendarID: "work", Type: "put"})
+	if got := recv(t, bob); got.CalendarID != "work" || got.Owner != "alice" {
+		t.Fatalf("bob should receive alice/work, got %+v", got)
+	}
+	// A change to alice's OTHER calendar must NOT reach bob (no grant on it).
+	h.Publish(store.Change{Seq: 2, Owner: "alice", CalendarID: "private", Type: "put"})
+	select {
+	case c := <-bob:
+		t.Fatalf("bob should not receive alice/private, got %+v", c)
+	case <-time.After(100 * time.Millisecond):
 	}
 }

@@ -2,7 +2,7 @@
 // attribute set the backend models, converting local wall-clock input to the UTC instants the
 // store persists. All controls are @holistic/ui primitives (raw HTML is forbidden in service
 // UIs); there is no SDK date picker, so we drive native pickers through <Input type="…">.
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import {
   Autocomplete,
   Box,
@@ -30,22 +30,26 @@ import {
   addDays,
   colorCss,
   dateInputToUTCISO,
+  humanizeRRule,
   isoToDateInput,
   isoToLocalInput,
   localInputToISO,
   mapsURL,
   newGeoSession,
 } from './helpers';
+import { RecurrenceEditor } from './RecurrenceEditor';
 
 interface EventEditorProps {
   api: ServiceApiClient;
   ui: ServiceContextProps['ui'];
   calendarId: string;
+  owner?: string; // calendar owner (for a shared calendar); empty/self for own calendars
   event: CalEvent | null; // null => create
   defaultStart?: Date;
   canEdit: boolean;
   selfEmail: string; // the caller's address, to surface RSVP controls when they are a guest
   searchContacts: (query: string) => Promise<ContactOption[]>; // contax directory for attendee pickers
+  onExpandGroup?: (groupId: string) => Promise<ContactOption[]>; // expand a contax group to members
   onClose: () => void;
   onSaved: () => void;
 }
@@ -77,7 +81,8 @@ function nextHour(d: Date): Date {
   return x;
 }
 
-export function EventEditor({ api, ui, calendarId, event, defaultStart, canEdit, selfEmail, searchContacts, onClose, onSaved }: EventEditorProps) {
+export function EventEditor({ api, ui, calendarId, owner, event, defaultStart, canEdit, selfEmail, searchContacts, onExpandGroup, onClose, onSaved }: EventEditorProps) {
+  const ownerQuery = owner ? `?owner=${encodeURIComponent(owner)}` : '';
   const seed = useMemo(() => {
     if (event) {
       const allDay = !!event.allDay;
@@ -126,9 +131,51 @@ export function EventEditor({ api, ui, calendarId, event, defaultStart, canEdit,
   // recurrenceId; editing/deleting it asks the user for the scope (this / following / all).
   const isSeries = !!event?.rrule && !!event?.recurrenceId;
   const [scopePrompt, setScopePrompt] = useState<'save' | 'delete' | null>(null);
+  const [customRepeat, setCustomRepeat] = useState(false);
+  // Alt+↑/↓ jumps focus between the Start and Ende time fields (plain ↑/↓ stays native increment).
+  const startRef = useRef<HTMLInputElement>(null);
+  const endRef = useRef<HTMLInputElement>(null);
 
   const myAttendee = event?.attendees?.find((a) => norm(a.email) === norm(selfEmail));
   const [myStat, setMyStat] = useState(myAttendee?.partStat ?? '');
+
+  // Unsaved-changes guard: a stable fingerprint of every save-relevant field. Captured once at
+  // mount (the pristine state); any later divergence means the form is dirty, so an accidental
+  // click-outside / Escape / Cancel asks before throwing the edit away.
+  function snapshot(): string {
+    return JSON.stringify({
+      summary: summary.trim(),
+      location: location.trim(),
+      geo: geo ?? null,
+      description: description.trim(),
+      conference: conference.trim(),
+      url: url.trim(),
+      allDay,
+      start,
+      end,
+      color,
+      status,
+      busy,
+      rrule,
+      categories: categories.trim(),
+      required: required.map((r) => r.email),
+      optional: optional.map((o) => o.email),
+      alarm,
+    });
+  }
+  const pristine = useMemo(() => snapshot(), []);
+
+  async function attemptClose() {
+    if (!saving && snapshot() !== pristine) {
+      const ok = await ui.confirm({
+        title: 'Ungespeicherte Änderungen verwerfen?',
+        confirmLabel: 'Verwerfen',
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    onClose();
+  }
 
   // When toggling all-day, convert between date and datetime-local representations.
   function toggleAllDay(on: boolean) {
@@ -233,7 +280,7 @@ export function EventEditor({ api, ui, calendarId, event, defaultStart, canEdit,
     setScopePrompt(null);
     setSaving(true);
     try {
-      await api.post('events', payload);
+      await api.post('events' + ownerQuery, payload);
       ui.toast({ title: event ? 'Event updated' : 'Event created', variant: 'success' });
       onSaved();
       onClose();
@@ -255,7 +302,7 @@ export function EventEditor({ api, ui, calendarId, event, defaultStart, canEdit,
     setScopePrompt(null);
     setSaving(true);
     try {
-      await api.post('events/delete', { calendar: calendarId, uid: event.uid, editScope: scope, recurrenceId: event.recurrenceId });
+      await api.post('events/delete', { calendar: calendarId, owner, uid: event.uid, editScope: scope, recurrenceId: event.recurrenceId });
       ui.toast({ title: 'Event deleted', variant: 'success' });
       onSaved();
       onClose();
@@ -278,7 +325,7 @@ export function EventEditor({ api, ui, calendarId, event, defaultStart, canEdit,
     }
   }
 
-  const rruleLabel = RRULE_PRESETS.find((p) => p.value === rrule)?.label ?? 'Custom rule';
+  const rruleLabel = RRULE_PRESETS.find((p) => p.value === rrule)?.label ?? humanizeRRule(rrule);
   const alarmLabel = ALARM_PRESETS.find((p) => p.value === alarm)?.label ?? `Custom (${alarm})`;
 
   const footer = (
@@ -291,7 +338,7 @@ export function EventEditor({ api, ui, calendarId, event, defaultStart, canEdit,
         )}
       </Box>
       <Stack direction="row" gap={2}>
-        <Button variant="ghost" onClick={onClose} disabled={saving}>
+        <Button variant="ghost" onClick={attemptClose} disabled={saving}>
           {canEdit ? 'Cancel' : 'Close'}
         </Button>
         {canEdit && (
@@ -339,7 +386,15 @@ export function EventEditor({ api, ui, calendarId, event, defaultStart, canEdit,
   return (
     <>
       {scopeChooser}
-    <Modal open onOpenChange={(o) => !o && onClose()} title={event ? 'Edit event' : 'New event'} size="lg" footer={footer}>
+      {customRepeat && (
+        <RecurrenceEditor
+          initial={rrule}
+          startISO={allDay ? dateInputToUTCISO(start) : localInputToISO(start)}
+          onDone={setRrule}
+          onClose={() => setCustomRepeat(false)}
+        />
+      )}
+    <Modal open onOpenChange={(o) => !o && attemptClose()} title={event ? 'Edit event' : 'New event'} size="lg" footer={footer}>
       <Stack gap={4}>
         <Field label="Title">
           <Input value={summary} onChange={(e) => setSummary(e.target.value)} placeholder="Add a title" disabled={!canEdit} autoFocus />
@@ -364,10 +419,36 @@ export function EventEditor({ api, ui, calendarId, event, defaultStart, canEdit,
 
         <Stack direction="row" gap={3} wrap>
           <Field label="Starts">
-            <Input type={allDay ? 'date' : 'datetime-local'} value={start} onChange={(e) => setStart(e.target.value)} disabled={!canEdit} />
+            {/* Native ↑/↓ still increments the focused segment; Alt+↓ jumps to the Ende field. */}
+            <Input
+              ref={startRef}
+              type={allDay ? 'date' : 'datetime-local'}
+              value={start}
+              onChange={(e) => setStart(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.altKey && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+                  e.preventDefault();
+                  endRef.current?.focus();
+                }
+              }}
+              disabled={!canEdit}
+            />
           </Field>
           <Field label="Ends">
-            <Input type={allDay ? 'date' : 'datetime-local'} value={end} onChange={(e) => setEnd(e.target.value)} disabled={!canEdit} />
+            {/* Alt+↑ jumps back to the Starts field (Alt+↓ stays; plain ↑/↓ = native increment). */}
+            <Input
+              ref={endRef}
+              type={allDay ? 'date' : 'datetime-local'}
+              value={end}
+              onChange={(e) => setEnd(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+                  e.preventDefault();
+                  startRef.current?.focus();
+                }
+              }}
+              disabled={!canEdit}
+            />
           </Field>
         </Stack>
 
@@ -395,7 +476,10 @@ export function EventEditor({ api, ui, calendarId, event, defaultStart, canEdit,
         <Field label="Repeat">
           <DropdownMenu
             trigger={<Button variant="secondary" disabled={!canEdit}>{rruleLabel}</Button>}
-            items={RRULE_PRESETS.map((p) => ({ id: p.value || 'none', label: p.label, onSelect: () => setRrule(p.value) }))}
+            items={[
+              ...RRULE_PRESETS.map((p) => ({ id: p.value || 'none', label: p.label, onSelect: () => setRrule(p.value) })),
+              { id: '__custom', label: 'Benutzerdefiniert…', separatorBefore: true, onSelect: () => setCustomRepeat(true) },
+            ]}
           />
         </Field>
 
@@ -432,10 +516,10 @@ export function EventEditor({ api, ui, calendarId, event, defaultStart, canEdit,
         </Field>
 
         <Field label="Required attendees" hint="Nach Name/Nickname suchen oder eine E-Mail eingeben. Sie werden benachrichtigt und um Antwort gebeten.">
-          <ContactPicker value={required} onChange={setRequired} onSearch={searchContacts} placeholder="Name oder Adresse …" disabled={!canEdit} />
+          <ContactPicker value={required} onChange={setRequired} onSearch={searchContacts} onExpandGroup={onExpandGroup} placeholder="Name oder Adresse …" disabled={!canEdit} />
         </Field>
         <Field label="Optional attendees" hint="Zur Information eingeladen; gleich benachrichtigt, aber als optional markiert.">
-          <ContactPicker value={optional} onChange={setOptional} onSearch={searchContacts} placeholder="Name oder Adresse …" disabled={!canEdit} />
+          <ContactPicker value={optional} onChange={setOptional} onSearch={searchContacts} onExpandGroup={onExpandGroup} placeholder="Name oder Adresse …" disabled={!canEdit} />
         </Field>
 
         <Field label="Categories" hint="Comma separated">

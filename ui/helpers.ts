@@ -125,6 +125,95 @@ export const RRULE_PRESETS: { label: string; value: string }[] = [
   { label: 'Yearly', value: 'FREQ=YEARLY' },
 ];
 
+// ── Custom recurrence (Google-Calendar-style builder) ────────────────────────────────────
+// A small, lossless-enough model of the RRULE subset the builder edits. Rules the builder can't
+// represent (BYMONTHDAY, BYSETPOS, …) still round-trip as raw text through the editor untouched.
+export type RecurFreq = 'DAILY' | 'WEEKLY' | 'MONTHLY' | 'YEARLY';
+export type RecurEnd = { type: 'never' } | { type: 'until'; date: string } | { type: 'count'; count: number };
+
+export interface RecurrenceRule {
+  freq: RecurFreq;
+  interval: number; // "every N ‹unit›"; 1 = every
+  byday: string[]; // weekly only: subset of RRULE_WEEKDAYS
+  end: RecurEnd;
+}
+
+// RRULE weekday tokens in ISO order (Mon first), with UI labels.
+export const RRULE_WEEKDAYS: { token: string; label: string }[] = [
+  { token: 'MO', label: 'Mo' },
+  { token: 'TU', label: 'Di' },
+  { token: 'WE', label: 'Mi' },
+  { token: 'TH', label: 'Do' },
+  { token: 'FR', label: 'Fr' },
+  { token: 'SA', label: 'Sa' },
+  { token: 'SU', label: 'So' },
+];
+
+const UNIT_LABEL: Record<RecurFreq, [one: string, many: string]> = {
+  DAILY: ['Tag', 'Tage'],
+  WEEKLY: ['Woche', 'Wochen'],
+  MONTHLY: ['Monat', 'Monate'],
+  YEARLY: ['Jahr', 'Jahre'],
+};
+
+// Parse an RRULE body ("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;UNTIL=…") into the builder model.
+// Returns null when there is no FREQ (nothing to edit).
+export function parseRRule(rrule: string): RecurrenceRule | null {
+  if (!rrule.trim()) return null;
+  const parts: Record<string, string> = {};
+  for (const seg of rrule.replace(/^RRULE:/i, '').split(';')) {
+    const eq = seg.indexOf('=');
+    if (eq > 0) parts[seg.slice(0, eq).trim().toUpperCase()] = seg.slice(eq + 1).trim();
+  }
+  const freq = (parts.FREQ || '').toUpperCase() as RecurFreq;
+  if (!['DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY'].includes(freq)) return null;
+  const interval = Math.max(1, parseInt(parts.INTERVAL || '1', 10) || 1);
+  const byday = (parts.BYDAY || '')
+    .split(',')
+    .map((d) => d.trim().toUpperCase())
+    .filter((d) => RRULE_WEEKDAYS.some((w) => w.token === d));
+  let end: RecurEnd = { type: 'never' };
+  if (parts.COUNT) end = { type: 'count', count: Math.max(1, parseInt(parts.COUNT, 10) || 1) };
+  else if (parts.UNTIL) {
+    const m = parts.UNTIL.match(/^(\d{4})(\d{2})(\d{2})/);
+    if (m) end = { type: 'until', date: `${m[1]}-${m[2]}-${m[3]}` };
+  }
+  return { freq, interval, byday, end };
+}
+
+// Serialise the builder model back to an RRULE body. UNTIL is emitted as an inclusive
+// end-of-day UTC instant so the last occurrence on the chosen date is kept.
+export function buildRRule(r: RecurrenceRule): string {
+  const out = [`FREQ=${r.freq}`];
+  if (r.interval > 1) out.push(`INTERVAL=${r.interval}`);
+  if (r.freq === 'WEEKLY' && r.byday.length) {
+    const ordered = RRULE_WEEKDAYS.filter((w) => r.byday.includes(w.token)).map((w) => w.token);
+    out.push(`BYDAY=${ordered.join(',')}`);
+  }
+  if (r.end.type === 'count') out.push(`COUNT=${r.end.count}`);
+  else if (r.end.type === 'until' && r.end.date) out.push(`UNTIL=${r.end.date.replace(/-/g, '')}T235959Z`);
+  return out.join(';');
+}
+
+// A human label for the Repeat button when a rule isn't one of the presets.
+export function humanizeRRule(rrule: string): string {
+  const r = parseRRule(rrule);
+  if (!r) return rrule ? 'Benutzerdefiniert' : 'Wiederholt sich nicht';
+  const [one, many] = UNIT_LABEL[r.freq];
+  let s = r.interval === 1 ? `Jede(n) ${one}` : `Alle ${r.interval} ${many}`;
+  if (r.freq === 'WEEKLY' && r.byday.length) {
+    const days = RRULE_WEEKDAYS.filter((w) => r.byday.includes(w.token)).map((w) => w.label);
+    s += ` (${days.join(', ')})`;
+  }
+  if (r.end.type === 'until' && r.end.date) {
+    const d = new Date(`${r.end.date}T00:00:00`);
+    s += `, bis ${d.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })}`;
+  } else if (r.end.type === 'count') {
+    s += `, ${r.end.count}×`;
+  }
+  return s;
+}
+
 // ── browser file pick / download (document/window are not restricted globals) ────────────
 
 export function pickTextFile(accept = '.ics,text/calendar'): Promise<string | null> {

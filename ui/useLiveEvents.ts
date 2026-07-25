@@ -15,7 +15,7 @@ export interface LiveEvents {
   refresh: () => void;
 }
 
-export function useLiveEvents(api: ServiceApiClient, calendar: string, from: Date, to: Date): LiveEvents {
+export function useLiveEvents(api: ServiceApiClient, owner: string, calendar: string, from: Date, to: Date): LiveEvents {
   const [live, setLive] = useState(false);
   const fromISO = from.toISOString();
   const toISO = to.toISOString();
@@ -23,10 +23,10 @@ export function useLiveEvents(api: ServiceApiClient, calendar: string, from: Dat
   const q = useLiveQuery<EventsResp>(
     () =>
       api.get<EventsResp>(
-        `events?calendar=${encodeURIComponent(calendar)}&start=${encodeURIComponent(fromISO)}&end=${encodeURIComponent(toISO)}`,
+        `events?calendar=${encodeURIComponent(calendar)}&owner=${encodeURIComponent(owner)}&start=${encodeURIComponent(fromISO)}&end=${encodeURIComponent(toISO)}`,
       ),
     live ? 60000 : 4000,
-    [calendar, fromISO, toISO, live],
+    [owner, calendar, fromISO, toISO, live],
   );
 
   // Keep the latest refresh in a ref so the long-lived SSE listener always calls the current one.
@@ -47,8 +47,12 @@ export function useLiveEvents(api: ServiceApiClient, calendar: string, from: Dat
     const onChanged = (e: MessageEvent) => {
       let forThisCal = true;
       try {
-        const data = JSON.parse(e.data) as { calendar?: string };
-        if (data && data.calendar) forThisCal = data.calendar === calendar;
+        const data = JSON.parse(e.data) as { calendar?: string; owner?: string };
+        // Match on (owner, calendar): ids are only unique per owner, so a shared calendar and an
+        // own calendar can share an id. A frame without owner (older server) matches on id alone.
+        if (data && data.calendar) {
+          forThisCal = data.calendar === calendar && (!data.owner || data.owner === owner);
+        }
       } catch {
         /* malformed frame: refresh anyway */
       }
@@ -61,7 +65,7 @@ export function useLiveEvents(api: ServiceApiClient, calendar: string, from: Dat
       closed = true;
       if (es) es.close();
     };
-  }, [api, calendar]);
+  }, [api, owner, calendar]);
 
   return {
     events: q.data?.events ?? [],

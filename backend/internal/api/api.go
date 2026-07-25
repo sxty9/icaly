@@ -26,6 +26,7 @@ import (
 	"icaly/internal/geocode"
 	"icaly/internal/ical"
 	"icaly/internal/instance"
+	"icaly/internal/notify"
 	"icaly/internal/push"
 	"icaly/internal/rights"
 	"icaly/internal/scheduling"
@@ -60,19 +61,26 @@ type Server struct {
 	geo           *geocode.Service // server-side place-search proxy for the location picker
 	geoRate       *rateLimiter     // per-user cap on geocode lookups (abuse / cost guard)
 	thr           *throttle        // per-IP auth-failure backoff for the DAV brute-force surface (M4)
-	inboundSecret string           // shared icaly↔maild secret guarding POST imip/inbound
+	inboundSecret string             // shared icaly↔maild secret guarding POST imip/inbound
+	gc            store.GroupChecker // live contax personal-group membership for sharing (nil ⇒ contax grants inert)
+	notifier      *notify.Client     // notifyd client: tells internal grantees a calendar was shared with them
 }
 
 // New builds a server. ap may be nil (CalDAV app-password auth then unavailable); geo may be nil
 // (the location picker then degrades to free text). inboundSecret guards the machine-to-machine
 // iMIP inbound webhook; "" disables it (so a misconfigured deploy fails closed rather than open).
-func New(v *auth.Verifier, st *store.Store, inst *instance.Resolver, hub *push.Hub, sched *scheduling.Scheduler, ap *apppass.Store, geo *geocode.Service, inboundSecret string) *Server {
+// gc resolves live contax personal-group membership for calendar sharing; nil leaves contax-group
+// grants inert (holistic/ad-hoc sharing still works). notifier (may be a disabled client) tells
+// internal grantees, in-app, when a calendar is shared with them.
+func New(v *auth.Verifier, st *store.Store, inst *instance.Resolver, hub *push.Hub, sched *scheduling.Scheduler, ap *apppass.Store, geo *geocode.Service, inboundSecret string, gc store.GroupChecker, notifier *notify.Client) *Server {
 	return &Server{
 		v: v, st: st, inst: inst, hub: hub, sched: sched, ap: ap, geo: geo,
-		dav:           caldav.New(st, base+"dav/", inst.Address),
+		dav:           caldav.New(st, base+"dav/", inst.Address, gc),
 		geoRate:       newRateLimiter(10*time.Second, 30), // 30 lookups / 10s / user (UI debounces too)
 		thr:           newThrottle(),
 		inboundSecret: inboundSecret,
+		gc:            gc,
+		notifier:      notifier,
 	}
 }
 
@@ -88,6 +96,17 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET "+base+"calendars", s.guard(rights.GroupView, false, s.calendars))
 	mux.HandleFunc("POST "+base+"calendars", s.guard(rights.GroupShare, true, s.createCalendar))
+	mux.HandleFunc("POST "+base+"calendars/update", s.guard(rights.GroupShare, true, s.updateCalendar))
+	mux.HandleFunc("POST "+base+"calendars/delete", s.guard(rights.GroupShare, true, s.deleteCalendar))
+
+	// Per-calendar sharing (ACL): only the owner manages their own calendar's grants. Reuses the
+	// share right (its manifest doc already reserves it for "per-calendar ACLs").
+	mux.HandleFunc("GET "+base+"calendars/grants", s.guard(rights.GroupShare, false, s.listGrants))
+	mux.HandleFunc("POST "+base+"calendars/grants", s.guard(rights.GroupShare, true, s.addGrant))
+	mux.HandleFunc("POST "+base+"calendars/grants/update", s.guard(rights.GroupShare, true, s.updateGrant))
+	mux.HandleFunc("POST "+base+"calendars/grants/delete", s.guard(rights.GroupShare, true, s.removeGrant))
+	// The Holistic groups a sharer may pick from: the caller's own OS groups, minus system/right groups.
+	mux.HandleFunc("GET "+base+"shareable-groups", s.guard(rights.GroupShare, false, s.shareableGroups))
 
 	mux.HandleFunc("GET "+base+"events", s.guard(rights.GroupView, false, s.listEvents))
 	mux.HandleFunc("GET "+base+"event", s.guard(rights.GroupView, false, s.getEvent))
@@ -160,7 +179,8 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request, u *auth.User) {
 }
 
 func (s *Server) calendars(w http.ResponseWriter, _ *http.Request, u *auth.User) {
-	cals, err := s.st.Calendars(u.Username)
+	// Own calendars unioned with any shared to this user (via holistic/contax groups or ad-hoc sets).
+	cals, err := s.st.CalendarsFor(u.Username, u.Groups, s.gc)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not open calendars")
 		return
@@ -170,6 +190,18 @@ func (s *Server) calendars(w http.ResponseWriter, _ *http.Request, u *auth.User)
 		"mailDomain": s.inst.MailDomain(),
 		"calendars":  cals,
 	})
+}
+
+// resolveOwner resolves the real owner of the calendar a request targets — the ?owner= query param,
+// defaulting to the caller — plus the caller's access level to (owner, calID). Own calendars always
+// resolve to edit; a shared calendar is addressed by adding ?owner=<owner>. Because owner defaults
+// to the caller, every existing own-calendar request is unchanged.
+func (s *Server) resolveOwner(u *auth.User, r *http.Request, calID string) (string, store.Access) {
+	owner := strings.TrimSpace(r.URL.Query().Get("owner"))
+	if owner == "" {
+		owner = u.Username
+	}
+	return owner, s.st.AccessLevel(u.Username, u.Groups, u.IsAdmin, owner, calID, s.gc)
 }
 
 func (s *Server) createCalendar(w http.ResponseWriter, r *http.Request, u *auth.User) {
@@ -190,11 +222,293 @@ func (s *Server) createCalendar(w http.ResponseWriter, r *http.Request, u *auth.
 	writeJSON(w, http.StatusOK, cal)
 }
 
+// updateCalendar edits a calendar's own details (name, colour). A nil field is left unchanged; a
+// supplied name must be non-empty. Same right as create/delete — this is calendar management.
+func (s *Server) updateCalendar(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	var req struct {
+		ID    string  `json:"id"`
+		Name  *string `json:"name"`
+		Color *string `json:"color"`
+	}
+	if !decodeBody(w, r, &req) || strings.TrimSpace(req.ID) == "" {
+		writeErr(w, http.StatusBadRequest, "A calendar id is required")
+		return
+	}
+	if req.Name != nil {
+		n := strings.TrimSpace(*req.Name)
+		if n == "" {
+			writeErr(w, http.StatusBadRequest, "A calendar name is required")
+			return
+		}
+		req.Name = &n
+	}
+	if err := s.st.UpdateCalendar(u.Username, strings.TrimSpace(req.ID), req.Name, req.Color); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "Unknown calendar")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "Could not update calendar")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// deleteCalendar removes one of the caller's calendars and all its events. The default "personal"
+// calendar is refused: the store auto-provisions it (and much of the code defaults to it), so it
+// must always exist — deleting it would only see it silently recreated on next access.
+func (s *Server) deleteCalendar(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if !decodeBody(w, r, &req) || strings.TrimSpace(req.ID) == "" {
+		writeErr(w, http.StatusBadRequest, "A calendar id is required")
+		return
+	}
+	id := strings.TrimSpace(req.ID)
+	if id == "personal" {
+		writeErr(w, http.StatusBadRequest, "The primary calendar cannot be deleted")
+		return
+	}
+	if err := s.st.DeleteCalendar(u.Username, id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "Unknown calendar")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "Could not delete calendar")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// ── calendar sharing (ACL grants) ────────────────────────────────────────────────────
+// Grant management always operates on the CALLER's own calendars (owner = u.Username): a share
+// right lets you share what you own, not reach into others' calendars.
+
+func (s *Server) listGrants(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	calID := calendarParam(r)
+	grants, err := s.st.ListGrants(u.Username, calID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not read shares")
+		return
+	}
+	if grants == nil {
+		grants = []store.Grant{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"calendar": calID, "grants": grants})
+}
+
+func (s *Server) addGrant(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	var req struct {
+		Calendar        string   `json:"calendar"`
+		Kind            string   `json:"kind"`
+		Ref             string   `json:"ref"`
+		Label           string   `json:"label"`
+		Level           string   `json:"level"`
+		PublicExt       bool     `json:"publicExt"`
+		Members         []string `json:"members"`
+		NotifyExternals []string `json:"notifyExternals"` // external emails to email the subscription link
+		FeedURL         string   `json:"feedUrl"`         // absolute feed URL for that email (validated vs the token)
+	}
+	if !decodeBody(w, r, &req) {
+		writeErr(w, http.StatusBadRequest, "Invalid share")
+		return
+	}
+	calID := calOrDefault(req.Calendar)
+	g, err := s.st.AddGrant(u.Username, calID, strings.TrimSpace(req.Kind), strings.TrimSpace(req.Ref),
+		strings.TrimSpace(req.Label), strings.TrimSpace(req.Level), req.PublicExt, req.Members)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "Unknown calendar")
+			return
+		}
+		writeErr(w, http.StatusBadRequest, "Could not add share")
+		return
+	}
+	// Tell the people newly given access (best-effort; never fails the share).
+	if cal, ok := s.calendarOf(u.Username, calID); ok {
+		s.notifyShare(u, cal, g, req.NotifyExternals, req.FeedURL)
+	}
+	writeJSON(w, http.StatusOK, g)
+}
+
+// contaxMemberLister is the optional richer capability of the contax client used to list a group's
+// internal members for share notifications (store.GroupChecker only answers membership yes/no).
+type contaxMemberLister interface {
+	Members(grpID string) ([]string, bool)
+}
+
+// notifyShare informs the people a calendar was just shared with. Internal grantees get an in-app
+// notifyd notification; external addresses get an email with the read-only subscription link — but
+// only when the owner consented to the public link (g.PublicExt) AND holds the external-invite
+// rights (hp_icaly_invite + hp_mail_send). All best-effort: a transport failure never fails the
+// share. Holistic (OS group) shares are NOT fanned out per member (the group may be large and is
+// externally managed) — those members simply see the calendar appear.
+func (s *Server) notifyShare(u *auth.User, cal event.Calendar, g store.Grant, externals []string, feedURL string) {
+	// Internal, in-app.
+	var internal []string
+	switch g.Kind {
+	case "adhoc":
+		internal = g.Members
+	case "contax":
+		if lister, ok := s.gc.(contaxMemberLister); ok {
+			if m, found := lister.Members(g.Ref); found {
+				internal = m
+			}
+		}
+	}
+	if s.notifier != nil {
+		seen := map[string]bool{u.Username: true} // never notify the sharer
+		for _, member := range internal {
+			member = strings.TrimSpace(member)
+			if member == "" || seen[member] {
+				continue
+			}
+			seen[member] = true
+			_ = s.notifier.Emit(notify.EmitInput{
+				User:    member,
+				Service: service,
+				Title:   "Kalender geteilt",
+				Body:    fmt.Sprintf("%s hat den Kalender „%s“ mit dir geteilt.", u.Username, cal.Name),
+				URL:     "/app/" + service,
+				Level:   "info",
+				Dedupe:  "icaly-share-" + g.ID + "-" + member,
+			})
+		}
+	}
+
+	// External email — consent + external-invite rights + a link that really points at this feed.
+	if !g.PublicExt || len(externals) == 0 || s.sched == nil {
+		return
+	}
+	if !(u.Can(rights.GroupInvite) && u.Can(mailSendRight)) {
+		return
+	}
+	link := shareFeedLink(feedURL, cal.FeedToken)
+	to := cleanExternals(externals)
+	if link == "" || len(to) == 0 {
+		return
+	}
+	from := s.inst.Address(u.Username)
+	subject := fmt.Sprintf("%s hat einen Kalender mit dir geteilt", from)
+	body := fmt.Sprintf("%s teilt den Kalender „%s“ mit dir.\n\nZum Abonnieren (nur Lesen) diesen Link in deiner Kalender-App hinzufügen:\n%s\n", from, cal.Name, link)
+	_ = s.sched.SendPlain(u.Username, to, subject, body)
+}
+
+// shareFeedLink returns the subscription link to email an external recipient: the client-supplied
+// feed URL, accepted ONLY when it points at THIS calendar's feed token (so a caller cannot make
+// icaly email an arbitrary/phishing URL). Empty when it is missing or does not match.
+func shareFeedLink(feedURL, token string) string {
+	feedURL = strings.TrimSpace(feedURL)
+	if feedURL == "" || token == "" || !strings.Contains(feedURL, "feeds/"+token+".ics") {
+		return ""
+	}
+	return feedURL
+}
+
+// cleanExternals normalises + dedupes external email addresses, dropping anything that is not a
+// plain address (a coarse sanity check; delivery does the real validation).
+func cleanExternals(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, e := range in {
+		e = strings.ToLower(strings.TrimSpace(e))
+		if e == "" || seen[e] || !strings.Contains(e, "@") || strings.ContainsAny(e, " \t") {
+			continue
+		}
+		seen[e] = true
+		out = append(out, e)
+	}
+	return out
+}
+
+func (s *Server) updateGrant(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	var req struct {
+		Calendar  string   `json:"calendar"`
+		ID        string   `json:"id"`
+		Level     string   `json:"level"`
+		PublicExt bool     `json:"publicExt"`
+		Members   []string `json:"members"`
+	}
+	if !decodeBody(w, r, &req) || strings.TrimSpace(req.ID) == "" {
+		writeErr(w, http.StatusBadRequest, "A grant id is required")
+		return
+	}
+	if err := s.st.SetGrant(u.Username, calOrDefault(req.Calendar), strings.TrimSpace(req.ID),
+		strings.TrimSpace(req.Level), req.PublicExt, req.Members); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "Unknown share")
+			return
+		}
+		writeErr(w, http.StatusBadRequest, "Could not update share")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) removeGrant(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	var req struct {
+		Calendar string `json:"calendar"`
+		ID       string `json:"id"`
+	}
+	if !decodeBody(w, r, &req) || strings.TrimSpace(req.ID) == "" {
+		writeErr(w, http.StatusBadRequest, "A grant id is required")
+		return
+	}
+	if err := s.st.RemoveGrant(u.Username, calOrDefault(req.Calendar), strings.TrimSpace(req.ID)); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "Unknown share")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "Could not remove share")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// shareableGroups returns the Holistic (OS) groups the caller may share a calendar with: their own
+// group memberships, minus service right-groups (hp_*) and system/plumbing groups. The caller shares
+// only with groups they themselves belong to.
+func (s *Server) shareableGroups(w http.ResponseWriter, _ *http.Request, u *auth.User) {
+	out := make([]string, 0, len(u.Groups))
+	for _, g := range u.Groups {
+		if shareableGroup(g) {
+			out = append(out, g)
+		}
+	}
+	sort.Strings(out)
+	writeJSON(w, http.StatusOK, map[string]any{"groups": out})
+}
+
+// shareableGroup filters OS groups to those meaningful as calendar-share targets: drops service
+// right-groups (hp_*) and system/plumbing groups; keeps custom groups and privleg contact bundles.
+func shareableGroup(g string) bool {
+	if g == "" || strings.HasPrefix(g, "hp_") {
+		return false
+	}
+	switch g {
+	case "sudo", "wheel", "root", "adm", "staff", "users", "nogroup", "smbusers", "holistic":
+		return false
+	}
+	return true
+}
+
+func calOrDefault(c string) string {
+	if c = strings.TrimSpace(c); c != "" {
+		return c
+	}
+	return "personal"
+}
+
 func (s *Server) listEvents(w http.ResponseWriter, r *http.Request, u *auth.User) {
 	calID := calendarParam(r)
+	owner, level := s.resolveOwner(u, r, calID)
+	if level == store.AccessNone {
+		writeErr(w, http.StatusNotFound, "Unknown calendar")
+		return
+	}
 	from := parseTime(r.URL.Query().Get("start"), time.Now().AddDate(0, -1, 0))
 	to := parseTime(r.URL.Query().Get("end"), time.Now().AddDate(0, 3, 0))
-	evs, err := s.st.ListEvents(u.Username, calID, from, to)
+	evs, err := s.st.ListEvents(owner, calID, from, to)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "Unknown calendar")
@@ -206,17 +520,22 @@ func (s *Server) listEvents(w http.ResponseWriter, r *http.Request, u *auth.User
 	if evs == nil {
 		evs = []*event.Event{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"calendar": calID, "events": evs})
+	writeJSON(w, http.StatusOK, map[string]any{"calendar": calID, "owner": owner, "events": evs})
 }
 
 func (s *Server) getEvent(w http.ResponseWriter, r *http.Request, u *auth.User) {
 	calID := calendarParam(r)
+	owner, level := s.resolveOwner(u, r, calID)
+	if level == store.AccessNone {
+		writeErr(w, http.StatusNotFound, "Event not found")
+		return
+	}
 	uid := strings.TrimSpace(r.URL.Query().Get("uid"))
 	if uid == "" {
 		writeErr(w, http.StatusBadRequest, "An event uid is required")
 		return
 	}
-	ev, etag, err := s.st.GetEvent(u.Username, calID, uid)
+	ev, etag, err := s.st.GetEvent(owner, calID, uid)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "Event not found")
 		return
@@ -254,18 +573,36 @@ func (s *Server) putEvent(w http.ResponseWriter, r *http.Request, u *auth.User) 
 		return
 	}
 	scope := strings.ToLower(strings.TrimSpace(req.EditScope))
+
+	// Resolve the target calendar's real owner (default the caller) and require edit access. A
+	// delegate editing a calendar shared to them writes into the owner's data.
+	owner, level := s.resolveOwner(u, r, calID)
+	if level != store.AccessEdit {
+		writeErr(w, http.StatusForbidden, "You cannot edit this calendar")
+		return
+	}
+	actingAsOwner := owner != u.Username
 	caller := s.inst.Address(u.Username)
 
 	// Organizer authority is taken from the STORED event, never the client payload (which could
 	// spoof ORGANIZER). A new event, or one this caller organizes, lets them drive invitations;
 	// an event delivered to them as an attendee (stored organizer is someone else) must NOT trigger
-	// organizer scheduling that mutates other users' calendars.
-	prev, _, _ := s.st.GetEvent(u.Username, calID, ev.UID)
-	isOrganizer := prev == nil || prev.Organizer == nil || prev.Organizer.Email == "" || sameAddr(prev.Organizer.Email, caller)
-	if isOrganizer {
-		ev.Organizer = &event.Participant{Email: caller, Username: u.Username, IsInternal: true} // never trust a client organizer
+	// organizer scheduling. A DELEGATE write into another user's shared calendar is stronger still:
+	// the event belongs to that calendar's owner, so the organizer is forced to the owner and NO
+	// iTIP is dispatched on their behalf — RFC 6638 scheduling-on-behalf-of (the reserved
+	// hp_icaly_delegate) is a deliberate follow-up. Do NOT "fix" this into sending mail as the owner.
+	prev, _, _ := s.st.GetEvent(owner, calID, ev.UID)
+	var isOrganizer bool
+	if actingAsOwner {
+		ev.Organizer = &event.Participant{Email: s.inst.Address(owner), Username: owner, IsInternal: true}
+		isOrganizer = false // suppress delegate-triggered scheduling
 	} else {
-		ev.Organizer = prev.Organizer // keep the real organizer; this caller only edits their own copy
+		isOrganizer = prev == nil || prev.Organizer == nil || prev.Organizer.Email == "" || sameAddr(prev.Organizer.Email, caller)
+		if isOrganizer {
+			ev.Organizer = &event.Participant{Email: caller, Username: u.Username, IsInternal: true} // never trust a client organizer
+		} else {
+			ev.Organizer = prev.Organizer // keep the real organizer; this caller only edits their own copy
+		}
 	}
 	mergePartStats(&ev, prev) // preserve attendees' collected RSVPs across an organizer edit
 
@@ -284,7 +621,7 @@ func (s *Server) putEvent(w http.ResponseWriter, r *http.Request, u *auth.User) 
 	// master's UID, its RRULE and the occurrence's recurrenceId).
 	if ev.RecurrenceID != nil && (scope == "this" || scope == "following") {
 		if scope == "this" {
-			if err := s.st.OverrideOccurrence(u.Username, calID, ev.UID, &ev); err != nil {
+			if err := s.st.OverrideOccurrence(owner, calID, ev.UID, &ev); err != nil {
 				writeErr(w, http.StatusInternalServerError, "Could not update this occurrence")
 				return
 			}
@@ -294,8 +631,8 @@ func (s *Server) putEvent(w http.ResponseWriter, r *http.Request, u *auth.User) 
 		// following: end the old series here, then create a fresh series from this occurrence,
 		// rebasing a COUNT-based rule to the remaining count so it doesn't restart the full count.
 		occ := *ev.RecurrenceID
-		tail, _ := s.st.SeriesTailRule(u.Username, calID, ev.UID, occ)
-		if err := s.st.TruncateSeries(u.Username, calID, ev.UID, occ); err != nil {
+		tail, _ := s.st.SeriesTailRule(owner, calID, ev.UID, occ)
+		if err := s.st.TruncateSeries(owner, calID, ev.UID, occ); err != nil {
 			writeErr(w, http.StatusInternalServerError, "Could not split the series")
 			return
 		}
@@ -310,7 +647,7 @@ func (s *Server) putEvent(w http.ResponseWriter, r *http.Request, u *auth.User) 
 		if tail != "" {
 			ns.RRule = tail
 		}
-		if _, err := s.st.PutEvent(u.Username, calID, ns); err != nil {
+		if _, err := s.st.PutEvent(owner, calID, ns); err != nil {
 			writeErr(w, http.StatusInternalServerError, "Could not create the new series")
 			return
 		}
@@ -335,7 +672,7 @@ func (s *Server) putEvent(w http.ResponseWriter, r *http.Request, u *auth.User) 
 		ev.ExDates = prev.ExDates // keep the series' existing exclusions
 		ev.Created = prev.Created
 		ev.Sequence = prev.Sequence + 1
-		if err := s.st.ReplaceMaster(u.Username, calID, ev.UID, &ev); err != nil {
+		if err := s.st.ReplaceMaster(owner, calID, ev.UID, &ev); err != nil {
 			writeErr(w, http.StatusInternalServerError, "Could not update the series")
 			return
 		}
@@ -344,7 +681,7 @@ func (s *Server) putEvent(w http.ResponseWriter, r *http.Request, u *auth.User) 
 	}
 
 	// Non-recurring event (or brand-new): a plain create/update.
-	etag, err := s.st.PutEvent(u.Username, calID, &ev)
+	etag, err := s.st.PutEvent(owner, calID, &ev)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "Unknown calendar")
@@ -365,6 +702,7 @@ func (s *Server) putEvent(w http.ResponseWriter, r *http.Request, u *auth.User) 
 func (s *Server) deleteEvent(w http.ResponseWriter, r *http.Request, u *auth.User) {
 	var req struct {
 		Calendar     string     `json:"calendar"`
+		Owner        string     `json:"owner"`
 		UID          string     `json:"uid"`
 		EditScope    string     `json:"editScope"`
 		RecurrenceID *time.Time `json:"recurrenceId"`
@@ -377,6 +715,17 @@ func (s *Server) deleteEvent(w http.ResponseWriter, r *http.Request, u *auth.Use
 	if calID == "" {
 		calID = "personal"
 	}
+	// Resolve the calendar's real owner (default caller) and require edit. Owner may be given in the
+	// body for a shared calendar.
+	owner := strings.TrimSpace(req.Owner)
+	if owner == "" {
+		owner = u.Username
+	}
+	if s.st.AccessLevel(u.Username, u.Groups, u.IsAdmin, owner, calID, s.gc) != store.AccessEdit {
+		writeErr(w, http.StatusForbidden, "You cannot edit this calendar")
+		return
+	}
+	actingAsOwner := owner != u.Username
 	uid := strings.TrimSpace(req.UID)
 	scope := strings.ToLower(strings.TrimSpace(req.EditScope))
 	canExternal := u.Can(rights.GroupInvite) && u.Can(mailSendRight)
@@ -384,17 +733,19 @@ func (s *Server) deleteEvent(w http.ResponseWriter, r *http.Request, u *auth.Use
 
 	// Capture the stored event first — both to notify attendees and to decide authority. Only the
 	// organizer may cancel for everyone; an attendee's delete just removes their own copy (it must
-	// never reach into other users' calendars). Authority comes from the stored ORGANIZER.
-	prev, _, _ := s.st.GetEvent(u.Username, calID, uid)
-	isOrganizer := prev == nil || prev.Organizer == nil || prev.Organizer.Email == "" || sameAddr(prev.Organizer.Email, caller)
+	// never reach into other users' calendars). Authority comes from the stored ORGANIZER. A delegate
+	// deleting from another user's shared calendar removes the data but dispatches NO iTIP on the
+	// owner's behalf (parity with putEvent; RFC 6638 is a follow-up).
+	prev, _, _ := s.st.GetEvent(owner, calID, uid)
+	isOrganizer := !actingAsOwner && (prev == nil || prev.Organizer == nil || prev.Organizer.Email == "" || sameAddr(prev.Organizer.Email, caller))
 
 	if req.RecurrenceID != nil && (scope == "this" || scope == "following") {
 		following := scope == "following"
 		var err error
 		if following {
-			err = s.st.TruncateSeries(u.Username, calID, uid, *req.RecurrenceID)
+			err = s.st.TruncateSeries(owner, calID, uid, *req.RecurrenceID)
 		} else {
-			err = s.st.ExcludeOccurrence(u.Username, calID, uid, *req.RecurrenceID)
+			err = s.st.ExcludeOccurrence(owner, calID, uid, *req.RecurrenceID)
 		}
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "Could not delete the occurrence(s)")
@@ -408,7 +759,7 @@ func (s *Server) deleteEvent(w http.ResponseWriter, r *http.Request, u *auth.Use
 	}
 
 	// Whole series (or a non-recurring event).
-	if err := s.st.DeleteEvent(u.Username, calID, uid); err != nil {
+	if err := s.st.DeleteEvent(owner, calID, uid); err != nil {
 		writeErr(w, http.StatusNotFound, "Event not found")
 		return
 	}
@@ -422,9 +773,14 @@ func (s *Server) deleteEvent(w http.ResponseWriter, r *http.Request, u *auth.Use
 // non-CANCELLED) event spans, sorted and merged. Recurring events are expanded by the store.
 func (s *Server) freebusy(w http.ResponseWriter, r *http.Request, u *auth.User) {
 	calID := calendarParam(r)
+	owner, level := s.resolveOwner(u, r, calID)
+	if level == store.AccessNone {
+		writeErr(w, http.StatusNotFound, "Unknown calendar")
+		return
+	}
 	from := parseTime(r.URL.Query().Get("start"), time.Now().AddDate(0, 0, -1))
 	to := parseTime(r.URL.Query().Get("end"), time.Now().AddDate(0, 1, 0))
-	evs, err := s.st.ListEvents(u.Username, calID, from, to)
+	evs, err := s.st.ListEvents(owner, calID, from, to)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "Unknown calendar")
@@ -470,6 +826,11 @@ func (s *Server) freebusy(w http.ResponseWriter, r *http.Request, u *auth.User) 
 // which posts through the CSRF-aware JSON client).
 func (s *Server) importEvents(w http.ResponseWriter, r *http.Request, u *auth.User) {
 	calID := calendarParam(r)
+	owner, level := s.resolveOwner(u, r, calID)
+	if level != store.AccessEdit {
+		writeErr(w, http.StatusForbidden, "You cannot edit this calendar")
+		return
+	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxImport))
 	if err != nil {
 		writeErr(w, http.StatusRequestEntityTooLarge, "Import payload too large")
@@ -497,7 +858,7 @@ func (s *Server) importEvents(w http.ResponseWriter, r *http.Request, u *auth.Us
 			continue
 		}
 		ev.CalendarID = calID
-		if _, err := s.st.PutEvent(u.Username, calID, ev); err != nil {
+		if _, err := s.st.PutEvent(owner, calID, ev); err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				writeErr(w, http.StatusNotFound, "Unknown calendar")
 				return
@@ -514,12 +875,17 @@ func (s *Server) importEvents(w http.ResponseWriter, r *http.Request, u *auth.Us
 // from the stored .ics files).
 func (s *Server) exportEvents(w http.ResponseWriter, r *http.Request, u *auth.User) {
 	calID := calendarParam(r)
-	cal, ok := s.calendarOf(u.Username, calID)
+	owner, level := s.resolveOwner(u, r, calID)
+	if level == store.AccessNone {
+		writeErr(w, http.StatusNotFound, "Unknown calendar")
+		return
+	}
+	cal, ok := s.calendarOf(owner, calID)
 	if !ok {
 		writeErr(w, http.StatusNotFound, "Unknown calendar")
 		return
 	}
-	raws, err := s.st.RawEvents(u.Username, calID)
+	raws, err := s.st.RawEvents(owner, calID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not read calendar")
 		return
@@ -590,7 +956,18 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, u *auth.User) {
 	h.Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
-	ch, cancel := s.hub.Subscribe(u.Username)
+	// Subscribe for the caller's own changes AND for calendars shared to them (so a change to a
+	// shared calendar pushes live, not just on the polling fallback). The access set is a snapshot at
+	// connect; the client's EventSource reconnects, refreshing it (and picking up revoked grants).
+	access := map[string]bool{}
+	if shared, err := s.st.CalendarsFor(u.Username, u.Groups, s.gc); err == nil {
+		for _, c := range shared {
+			if c.SharedBy != "" {
+				access[push.AccessKey(c.Owner, c.ID)] = true
+			}
+		}
+	}
+	ch, cancel := s.hub.Subscribe(u.Username, access)
 	defer cancel()
 
 	maxSeq, _ := s.st.MaxSeq(u.Username)
@@ -700,7 +1077,7 @@ func (s *Server) davHandler(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "You do not have permission to use calendars")
 		return
 	}
-	s.dav.Serve(w, r, u.Username, u.IsAdmin, u.Can(rights.GroupEdit))
+	s.dav.Serve(w, r, u.Username, u.Groups, u.IsAdmin, u.Can(rights.GroupEdit))
 }
 
 // authDav resolves the DAV principal from the holistic session cookie or, for native clients, an

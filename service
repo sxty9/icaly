@@ -122,6 +122,8 @@ Environment=HOLISTIC_INSTANCE=/var/lib/holistic/instance.json
 # daemon has no request context for these, so the unit is authoritative — set your origin here.
 Environment=ICALY_PUBLIC_ORIGIN=
 # The holistic mail service (maild), reused as the iMIP transport for external invitations.
+Environment=ICALY_CONTAX_URL=http://127.0.0.1:8777
+Environment=ICALY_CONTAX_SECRET_FILE=/etc/holistic/icaly-contax-secret
 Environment=ICALY_MAILD_URL=http://127.0.0.1:8775
 # Shared secret for the icaly↔maild calendar endpoints (provisioned by setup; absent until then).
 Environment=ICALY_MAIL_SECRET_FILE=/etc/holistic/icaly-mail-secret
@@ -130,6 +132,10 @@ Environment=ICALY_MAIL_SECRET_FILE=/etc/holistic/icaly-mail-secret
 # to switch to Google automatically. ICALY_GEOCODE_PROVIDER can force "photon"/"google"/"none".
 Environment=ICALY_GEOCODE_KEY_FILE=/etc/holistic/icaly-geocode-key
 Environment=ICALY_GEOCODE_PROVIDER=
+# Notification service (notifyd): reminders (VALARMs) are fired here. The shared emit secret is
+# provisioned by \`notify\`'s setup and is group-readable (holistic), which icaly already belongs to.
+Environment=ICALY_NOTIFY_URL=http://127.0.0.1:8778
+Environment=ICALY_NOTIFY_SECRET_FILE=/etc/holistic/notify-secret
 # Instance-wide hard ceiling on upstream geocoding calls per day (cost guard on a shared billed
 # key + courtesy to the free Photon instance). 0 disables it. This is belt-and-suspenders to the
 # per-user rate limit and the provider-side quota you set in the Google Cloud console.
@@ -223,6 +229,19 @@ provision_mail_secret() {
   chmod 0640 "$f"
 }
 
+# The shared icaly↔contax secret authenticates icaly's live contax-group membership lookups (calendar
+# sharing). Group-readable so both daemons (both in the holistic group) can read it; create-if-absent
+# and idempotent, so whichever of icaly/contax runs setup first wins and the other reuses it. contax's
+# own setup provisions the same file — installing sharing requires `./service setup` on BOTH.
+provision_contax_secret() {
+  local f=/etc/holistic/icaly-contax-secret
+  getent group "$HOLISTIC_GROUP" >/dev/null || { warn "group '$HOLISTIC_GROUP' missing — skipping contax secret"; return 0; }
+  command -v openssl >/dev/null || { warn "openssl not found — skipping contax secret"; return 0; }
+  [ -f "$f" ] || ( umask 077; openssl rand -hex 32 > "$f" )
+  chgrp "$HOLISTIC_GROUP" "$f" 2>/dev/null || true
+  chmod 0640 "$f"
+}
+
 # ── commands ────────────────────────────────────────────────────────────────────────
 cmd_init() {
   local name="${1:-}" old="myservice"
@@ -272,6 +291,7 @@ cmd_setup() {
 
   log "granting read on the shared JWT secret..."
   grant_secret_access
+  provision_contax_secret
 
   log "provisioning the icaly↔maild shared secret..."
   provision_mail_secret
