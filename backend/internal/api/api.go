@@ -597,7 +597,7 @@ func (s *Server) putEvent(w http.ResponseWriter, r *http.Request, u *auth.User) 
 		ev.Organizer = &event.Participant{Email: s.inst.Address(owner), Username: owner, IsInternal: true}
 		isOrganizer = false // suppress delegate-triggered scheduling
 	} else {
-		isOrganizer = prev == nil || prev.Organizer == nil || prev.Organizer.Email == "" || sameAddr(prev.Organizer.Email, caller)
+		isOrganizer = prev == nil || prev.Organizer == nil || prev.Organizer.Email == "" || event.SameAddr(prev.Organizer.Email, caller)
 		if isOrganizer {
 			ev.Organizer = &event.Participant{Email: caller, Username: u.Username, IsInternal: true} // never trust a client organizer
 		} else {
@@ -737,7 +737,7 @@ func (s *Server) deleteEvent(w http.ResponseWriter, r *http.Request, u *auth.Use
 	// deleting from another user's shared calendar removes the data but dispatches NO iTIP on the
 	// owner's behalf (parity with putEvent; RFC 6638 is a follow-up).
 	prev, _, _ := s.st.GetEvent(owner, calID, uid)
-	isOrganizer := !actingAsOwner && (prev == nil || prev.Organizer == nil || prev.Organizer.Email == "" || sameAddr(prev.Organizer.Email, caller))
+	isOrganizer := !actingAsOwner && (prev == nil || prev.Organizer == nil || prev.Organizer.Email == "" || event.SameAddr(prev.Organizer.Email, caller))
 
 	if req.RecurrenceID != nil && (scope == "this" || scope == "following") {
 		following := scope == "following"
@@ -758,9 +758,15 @@ func (s *Server) deleteEvent(w http.ResponseWriter, r *http.Request, u *auth.Use
 		return
 	}
 
-	// Whole series (or a non-recurring event).
+	// Whole series (or a non-recurring event). Distinguish a genuinely-missing event (404) from a
+	// server-side failure (500) — matching the CalDAV del handler — so a delete that failed is
+	// never misreported to the client as "already gone".
 	if err := s.st.DeleteEvent(owner, calID, uid); err != nil {
-		writeErr(w, http.StatusNotFound, "Event not found")
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "Event not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "Could not delete event")
 		return
 	}
 	if isOrganizer && s.sched != nil && prev != nil && len(prev.Attendees) > 0 {
@@ -1383,14 +1389,6 @@ func (s *Server) calendarOf(user, calID string) (event.Calendar, bool) {
 	return event.Calendar{}, false
 }
 
-// sameAddr compares two calendar-user addresses, ignoring case, whitespace and a mailto: scheme.
-func sameAddr(a, b string) bool {
-	n := func(s string) string {
-		return strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(s), "mailto:")))
-	}
-	return n(a) != "" && n(a) == n(b)
-}
-
 // dedupAttendees keeps the first occurrence of each distinct address (case/scheme-insensitive),
 // so an event never carries — or invites — the same person twice.
 func dedupAttendees(in []event.Participant) []event.Participant {
@@ -1400,7 +1398,7 @@ func dedupAttendees(in []event.Participant) []event.Participant {
 	seen := make(map[string]bool, len(in))
 	out := in[:0]
 	for _, a := range in {
-		k := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(a.Email), "mailto:")))
+		k := event.NormAddr(a.Email)
 		if k == "" || seen[k] {
 			continue
 		}
@@ -1422,7 +1420,7 @@ func mergePartStats(ev, prev *event.Event) {
 			continue // the client asserted a status — respect it
 		}
 		for _, p := range prev.Attendees {
-			if sameAddr(p.Email, ev.Attendees[i].Email) && p.PartStat != "" && p.PartStat != "NEEDS-ACTION" {
+			if event.SameAddr(p.Email, ev.Attendees[i].Email) && p.PartStat != "" && p.PartStat != "NEEDS-ACTION" {
 				ev.Attendees[i].PartStat = p.PartStat
 				break
 			}

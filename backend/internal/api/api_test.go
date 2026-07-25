@@ -329,6 +329,18 @@ func TestRSVPPreservedAcrossOrganizerEdit(t *testing.T) {
 	}
 }
 
+func TestDeleteMissingEventIs404(t *testing.T) {
+	h := newHarness(t)
+	// A whole-series delete of an event that does not exist must surface as 404 (ErrNotFound),
+	// not be swallowed — and, conversely, a real failure must not masquerade as 404.
+	body := `{"calendar":"personal","uid":"does-not-exist"}`
+	resp := h.do(t, h.req(t, http.MethodPost, base+"events/delete", strings.NewReader(body)))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("deleting a missing event: want 404, got %d", resp.StatusCode)
+	}
+}
+
 func TestAttendeeDedup(t *testing.T) {
 	h := newHarness(t)
 	body := `{"calendarId":"personal","summary":"Dup","start":"2026-09-02T09:00:00Z","end":"2026-09-02T10:00:00Z",` +

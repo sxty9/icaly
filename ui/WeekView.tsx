@@ -4,7 +4,7 @@
 import { type MouseEvent } from 'react';
 import { Box, Grid, Stack, Text, cn } from '@holistic/ui';
 import type { CalEvent } from './types';
-import { addDays, colorCss, eventOnDay, fmtTime, sameDay, startOfDay, startOfWeek } from './helpers';
+import { addDays, colorCss, eventsOnDay, fmtTime, sameDay, startOfDay, startOfWeek } from './helpers';
 
 interface WeekViewProps {
   anchor: Date;
@@ -21,9 +21,7 @@ export function WeekView({ anchor, events, onDayClick, onEventClick }: WeekViewP
   return (
     <Grid cols={7} gap={0}>
       {days.map((day) => {
-        const dayEvents = events
-          .filter((ev) => eventOnDay(ev, day))
-          .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
+        const dayEvents = eventsOnDay(events, day);
         const isToday = sameDay(day, today);
         return (
           <Box
