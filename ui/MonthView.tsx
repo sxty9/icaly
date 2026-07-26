@@ -1,8 +1,8 @@
-// MonthView renders the classic 6×7 month grid from @holistic/ui primitives (no raw HTML).
+// MonthView renders the classic 6×7 month grid from @holisdk/ui primitives (no raw HTML).
 // Each cell lists that day's event instances (recurrences are pre-expanded by the backend),
 // capped with a "+N more" overflow. Clicking a day starts a new event; clicking a chip edits.
 import { type MouseEvent } from 'react';
-import { Box, Grid, Stack, Text, cn } from '@holistic/ui';
+import { Box, Grid, Stack, Text, cn } from '@holisdk/ui';
 import type { CalEvent } from './types';
 import { WEEKDAYS, colorCss, eventsOnDay, fmtTime, monthMatrix, sameDay, startOfDay } from './helpers';
 

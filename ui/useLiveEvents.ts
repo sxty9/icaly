@@ -4,7 +4,7 @@
 // healthy, dropping to 4s when the stream is down (plan: SSE + polling fallback). EventSource is
 // authenticated by the same-origin session cookie — no header, no CSRF (plan m7).
 import { useEffect, useRef, useState } from 'react';
-import { useLiveQuery, type ServiceApiClient } from '@holistic/ui';
+import { useLiveQuery, type ServiceApiClient } from '@holisdk/ui';
 import type { CalEvent, EventsResp } from './types';
 
 export interface LiveEvents {

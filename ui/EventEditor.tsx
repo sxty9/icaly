@@ -1,6 +1,6 @@
 // EventEditor is the create/edit modal for a calendar event. It surfaces the Google/Outlook
 // attribute set the backend models, converting local wall-clock input to the UTC instants the
-// store persists. All controls are @holistic/ui primitives (raw HTML is forbidden in service
+// store persists. All controls are @holisdk/ui primitives (raw HTML is forbidden in service
 // UIs); there is no SDK date picker, so we drive native pickers through <Input type="…">.
 import { useMemo, useRef, useState } from 'react';
 import {
@@ -22,7 +22,7 @@ import {
   type ContactOption,
   type ServiceApiClient,
   type ServiceContextProps,
-} from '@holistic/ui';
+} from '@holisdk/ui';
 import type { CalEvent, GeocodeResp, GeoPlace, GeoPoint, GeoSuggestion, Participant } from './types';
 import {
   COLORS,

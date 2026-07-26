@@ -1,7 +1,7 @@
 # icaly
 
 **Holistic service** for calendaring: a Go daemon behind the holistic Caddy proxy plus a dashboard
-plugin built on the **`@holistic/ui`** SDK (consumed, never vendored). It stores each user's
+plugin built on the **`@holisdk/ui`** SDK (consumed, never vendored). It stores each user's
 calendars as RFC 5545 iCalendar objects, serves an in-app month/week/agenda calendar with live
 updates, and exposes the same data over **CalDAV**, a read-only **webcal/ICS** feed, and `.ics`
 import/export — so native clients (Apple Calendar, Thunderbird, DAVx⁵) stay in two-way sync.
@@ -24,7 +24,7 @@ Browser ── https://holistic.local (Caddy, same-origin) ─┐
 ## Prerequisites
 
 The **holistic** repo must be present **as a sibling**
-(`../holistic`) with the dashboard installed — it provides the `@holistic/ui` SDK and the SPA that
+(`../holistic`) with the dashboard installed — it provides the `@holisdk/ui` SDK and the SPA that
 bundles this plugin.
 
 ## Quickstart
@@ -82,7 +82,7 @@ ln -sfn "$PWD/ui" ../holistic/frontend/external/icaly
 ( cd ../holistic/frontend && pnpm --filter @holistic/app dev )   # http://localhost:5173
 ```
 
-UI imports are restricted to `@holistic/ui` + `react` (enforced by holistic's `eslint.services.cjs`
+UI imports are restricted to `@holisdk/ui` + `react` (enforced by holistic's `eslint.services.cjs`
 at SPA build time).
 
 ## Layout
@@ -105,7 +105,7 @@ backend/                    Go daemon (icalyd)
   internal/geocode/           server-side place-search proxy for the location picker
   internal/push/              per-user change hub feeding the live Server-Sent Events stream
   internal/instance/          resolves a user's calendar-user address + the instance mail domain
-ui/                         @holistic/ui plugin (linked into holistic/frontend/external/<id>)
+ui/                         @holisdk/ui plugin (linked into holistic/frontend/external/<id>)
 ```
 
 ### Going further: privileged actions

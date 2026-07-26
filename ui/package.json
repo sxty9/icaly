@@ -2,9 +2,9 @@
   "name": "@holistic/service-icaly",
   "private": true,
   "type": "module",
-  "comment": "This service's dashboard UI — a @holistic/ui plugin. Linked into holistic/frontend/external/<id> at install time and pulled into the host SPA by the build-time registry. Imports are limited to @holistic/ui + react (enforced by holistic's eslint.services.cjs).",
+  "comment": "This service's dashboard UI — a @holisdk/ui plugin. Linked into holistic/frontend/external/<id> at install time and pulled into the host SPA by the build-time registry. Imports are limited to @holisdk/ui + react (enforced by holistic's eslint.services.cjs).",
   "dependencies": {
-    "@holistic/ui": "workspace:*",
+    "@holisdk/ui": "workspace:*",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   }
