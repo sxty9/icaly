@@ -289,6 +289,34 @@ func (s *Store) Calendars(user string) ([]event.Calendar, error) {
 	return out, rows.Err()
 }
 
+// CalendarRef identifies one calendar by owner and id — the minimal key the store hands back to
+// callers that must enumerate calendars across all users (the reminder scan). It carries no
+// interpretation of the calendar's contents.
+type CalendarRef struct {
+	Owner string
+	ID    string
+}
+
+// CalendarRefs returns the (owner, id) of every calendar. It is a passive enumeration: the pool
+// hands back the stored keys and evaluates nothing — callers do their own per-calendar work through
+// the existing access points (e.g. ListEvents) rather than asking the store to interpret the data.
+func (s *Store) CalendarRefs() ([]CalendarRef, error) {
+	rows, err := s.db.Query(`SELECT owner, id FROM calendars ORDER BY owner, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CalendarRef
+	for rows.Next() {
+		var c CalendarRef
+		if err := rows.Scan(&c.Owner, &c.ID); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 // CreateCalendar adds a new personal calendar for the user.
 func (s *Store) CreateCalendar(user, name, color, tz string) (event.Calendar, error) {
 	s.mu.Lock()

@@ -1,20 +1,22 @@
-package store
+package reminder
 
 import (
 	"testing"
 	"time"
 
 	"icaly/internal/event"
+	"icaly/internal/store"
 )
 
 func TestDueReminders(t *testing.T) {
 	base := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC)
-	const look, back = 40 * 24 * time.Hour, 25 * time.Hour
 
-	// due queries the window (fire-1min, fire] and reports how many reminders fell in it.
+	// due stores ev in a fresh store, then asks the scheduler which reminders fall in
+	// (fire-1min, fire]. The scheduler performs the evaluation (the store no longer does), reading
+	// the event back only through the store's passive access points.
 	due := func(t *testing.T, ev *event.Event, fire time.Time) int {
 		t.Helper()
-		st, err := Open(t.TempDir())
+		st, err := store.Open(t.TempDir())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -22,9 +24,10 @@ func TestDueReminders(t *testing.T) {
 		if _, err := st.PutEvent("tester", "personal", ev); err != nil {
 			t.Fatal(err)
 		}
-		rs, err := st.DueReminders(fire.Add(-time.Minute), fire, look, back)
+		sc := &Scheduler{st: st}
+		rs, err := sc.dueReminders(fire.Add(-time.Minute), fire)
 		if err != nil {
-			t.Fatalf("DueReminders: %v", err)
+			t.Fatalf("dueReminders: %v", err)
 		}
 		return len(rs)
 	}
