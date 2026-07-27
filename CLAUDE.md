@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 Template for a **holistic service**. A developer clones it, runs `./service init <name>`, and
-builds out the backend + dashboard plugin. The holistic SDK (`@holistic/ui`) is **consumed
+builds out the backend + dashboard plugin. The holistic SDK (`@holisdk/ui`) is **consumed
 only** — never vendored or modified here.
 
 ## Where things are
@@ -14,13 +14,13 @@ only** — never vendored or modified here.
   helper does auth → optional right → optional CSRF. Add routes here.
 - `backend/internal/rights/` — the `hp_*` group constant(s); mirror `permissions/<id>.json`.
 - `ui/index.tsx` — default-exports the `ServicePlugin`; `id` MUST equal the manifest `service`.
-- `ui/Dashboard.tsx` — the plugin UI; renders **only** `@holistic/ui`, gates with `userHasRight`.
+- `ui/Dashboard.tsx` — the plugin UI; renders **only** `@holisdk/ui`, gates with `userHasRight`.
 
 ## Rules
 
 - Enforce every right as `isAdmin || group ∈ user.groups`, in both the backend and the UI.
 - Keep three things in sync: `permissions/<id>.json` ⇄ `internal/rights` ⇄ the UI right constant.
-- UI may import only `@holistic/ui` and `react` (holistic's `eslint.services.cjs` enforces it).
+- UI may import only `@holisdk/ui` and `react` (holistic's `eslint.services.cjs` enforces it).
 - The daemon runs unprivileged and escalates nothing. Privileged work needs a narrow sudo
   wrapper, not blanket sudo.
 

@@ -27,7 +27,7 @@ import {
   type ContactOption,
   type ServiceApiClient,
   type ServiceContextProps,
-} from '@holistic/ui';
+} from '@holisdk/ui';
 import type { AppPassword, AppPasswordsResp, Calendar, CreatedAppPassword, Grant, GrantsResp } from './types';
 import { COLORS, pickTextFile, webcalURL } from './helpers';
 

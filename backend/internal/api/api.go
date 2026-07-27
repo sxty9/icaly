@@ -56,11 +56,11 @@ type Server struct {
 	inst          *instance.Resolver
 	hub           *push.Hub
 	sched         *scheduling.Scheduler
-	ap            *apppass.Store   // app passwords for native CalDAV clients (HTTP Basic)
-	dav           *caldav.Handler  // CalDAV / WebDAV-Sync surface under dav/
-	geo           *geocode.Service // server-side place-search proxy for the location picker
-	geoRate       *rateLimiter     // per-user cap on geocode lookups (abuse / cost guard)
-	thr           *throttle        // per-IP auth-failure backoff for the DAV brute-force surface (M4)
+	ap            *apppass.Store     // app passwords for native CalDAV clients (HTTP Basic)
+	dav           *caldav.Handler    // CalDAV / WebDAV-Sync surface under dav/
+	geo           *geocode.Service   // server-side place-search proxy for the location picker
+	geoRate       *rateLimiter       // per-user cap on geocode lookups (abuse / cost guard)
+	thr           *throttle          // per-IP auth-failure backoff for the DAV brute-force surface (M4)
 	inboundSecret string             // shared icaly↔maild secret guarding POST imip/inbound
 	gc            store.GroupChecker // live contax personal-group membership for sharing (nil ⇒ contax grants inert)
 	notifier      *notify.Client     // notifyd client: tells internal grantees a calendar was shared with them
@@ -969,7 +969,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, u *auth.User) {
 	if shared, err := s.st.CalendarsFor(u.Username, u.Groups, s.gc); err == nil {
 		for _, c := range shared {
 			if c.SharedBy != "" {
-				access[push.AccessKey(c.Owner, c.ID)] = true
+				access[store.CalKey(c.Owner, c.ID)] = true
 			}
 		}
 	}

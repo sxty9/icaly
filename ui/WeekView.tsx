@@ -2,7 +2,7 @@
 // instances. A full time-of-day grid is a later refinement; this column list is the live,
 // portioned week overview for Phase 1a.
 import { type MouseEvent } from 'react';
-import { Box, Grid, Stack, Text, cn } from '@holistic/ui';
+import { Box, Grid, Stack, Text, cn } from '@holisdk/ui';
 import type { CalEvent } from './types';
 import { addDays, colorCss, eventsOnDay, fmtTime, sameDay, startOfDay, startOfWeek } from './helpers';
 

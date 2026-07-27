@@ -1,10 +1,10 @@
 {
-  "//": "Editor/standalone typecheck convenience. Assumes the holistic repo is a sibling (../../holistic). The authoritative checks are holistic's lint:services + vite build over frontend/external/<id>.",
-  "extends": "../../holistic/frontend/tsconfig.base.json",
+  "//": "Editor/standalone typecheck convenience. Assumes holisdk + holistic are siblings (../../holisdk, ../../holistic). The authoritative checks are holistic's lint:services + vite build over frontend/external/<id>.",
+  "extends": "../../holisdk/tsconfig.base.json",
   "compilerOptions": {
     "baseUrl": ".",
     "paths": {
-      "@holistic/ui": ["../../holistic/frontend/packages/ui/src/index.ts"]
+      "@holisdk/ui": ["../../holisdk/ui/src/index.ts"]
     }
   },
   "include": ["."]

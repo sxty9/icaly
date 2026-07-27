@@ -71,7 +71,7 @@ func TestPublishDropsOnFullChannel(t *testing.T) {
 func TestShareFanout(t *testing.T) {
 	h := &Hub{subs: make(map[string]map[*sub]struct{})}
 	// bob is a grantee of alice's "work" calendar only.
-	bob, cancel := h.Subscribe("bob", map[string]bool{AccessKey("alice", "work"): true})
+	bob, cancel := h.Subscribe("bob", map[string]bool{store.CalKey("alice", "work"): true})
 	defer cancel()
 
 	// A change to alice/work reaches bob (fan-out to the grantee).
