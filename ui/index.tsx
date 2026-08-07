@@ -1,4 +1,4 @@
-import { ClockIcon, type ServicePlugin } from '@holistic/ui';
+import { ClockIcon, type ServicePlugin } from '@holisdk/ui';
 import { Dashboard } from './Dashboard';
 
 // This service's dashboard plugin. Linked into holistic/frontend/external/<id> at install

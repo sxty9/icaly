@@ -26,7 +26,7 @@ type Grant struct {
 
 var errBadGrant = errors.New("invalid grant")
 
-func validKind(k string) bool { return k == "holistic" || k == "contax" || k == "adhoc" }
+func validKind(k string) bool  { return k == "holistic" || k == "contax" || k == "adhoc" }
 func validLevel(l string) bool { return l == "view" || l == "edit" }
 
 // AddGrant records a new sharing grant on the owner's calendar. For an ad-hoc grant, members are the
@@ -62,10 +62,13 @@ func (s *Store) AddGrant(owner, calID, kind, ref, label, level string, publicExt
 		}
 		g.Members = dedupStrings(members)
 	}
+	if err := refreshPublicTx(tx, owner, calID); err != nil {
+		_ = tx.Rollback()
+		return Grant{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return Grant{}, err
 	}
-	s.refreshPublic(owner, calID)
 	return g, nil
 }
 
@@ -101,10 +104,13 @@ func (s *Store) SetGrant(owner, calID, grantID, level string, publicExt bool, me
 			return err
 		}
 	}
+	if err := refreshPublicTx(tx, owner, calID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	s.refreshPublic(owner, calID)
 	return nil
 }
 
@@ -129,10 +135,13 @@ func (s *Store) RemoveGrant(owner, calID, grantID string) error {
 		_ = tx.Rollback()
 		return ErrNotFound
 	}
+	if err := refreshPublicTx(tx, owner, calID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	s.refreshPublic(owner, calID)
 	return nil
 }
 
@@ -187,15 +196,19 @@ func (s *Store) grantMembers(grantID string) ([]string, error) {
 	return out, rows.Err()
 }
 
-// refreshPublic keeps calendars.public in step with external-consent: on iff any grant on the
-// calendar has public_ext set. Best-effort (a failure only leaves the cosmetic flag stale).
-func (s *Store) refreshPublic(owner, calID string) {
+// refreshPublicTx keeps calendars.public in step with external-consent within the caller's
+// transaction: public is on iff any grant on the calendar has public_ext set. Folding it into the
+// grant mutation's own transaction makes the ACL change and its derived public flag one atomic unit
+// — there is no committed state in which a grant exists but the flag disagrees, and no crash window
+// between the two writes. The COUNT sees the just-applied grant change because it runs inside tx.
+func refreshPublicTx(tx *sql.Tx, owner, calID string) error {
 	var n int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM cal_grants WHERE owner=? AND cal_id=? AND public_ext=1`,
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM cal_grants WHERE owner=? AND cal_id=? AND public_ext=1`,
 		owner, calID).Scan(&n); err != nil {
-		return
+		return err
 	}
-	_, _ = s.db.Exec(`UPDATE calendars SET public=? WHERE owner=? AND id=?`, b2i(n > 0), owner, calID)
+	_, err := tx.Exec(`UPDATE calendars SET public=? WHERE owner=? AND id=?`, b2i(n > 0), owner, calID)
+	return err
 }
 
 func insertMembers(tx *sql.Tx, grantID string, members []string) error {

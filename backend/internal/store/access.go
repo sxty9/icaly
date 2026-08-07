@@ -97,7 +97,7 @@ func (s *Store) CalendarsFor(username string, groups []string, gc GroupChecker) 
 	seen := make(map[string]bool)
 	for _, c := range own {
 		out = append(out, SharedCalendar{Calendar: c, Level: AccessEdit})
-		seen[calKey(c.Owner, c.ID)] = true
+		seen[CalKey(c.Owner, c.ID)] = true
 	}
 
 	best := map[string]Access{}
@@ -105,7 +105,7 @@ func (s *Store) CalendarsFor(username string, groups []string, gc GroupChecker) 
 		if owner == username {
 			return
 		}
-		k := calKey(owner, calID)
+		k := CalKey(owner, calID)
 		best[k] = maxAccess(best[k], Access(level))
 	}
 
@@ -152,7 +152,7 @@ func (s *Store) CalendarsFor(username string, groups []string, gc GroupChecker) 
 		if seen[k] {
 			continue
 		}
-		owner, calID := splitKey(k)
+		owner, calID := SplitCalKey(k)
 		c, ok := s.calendarRow(owner, calID)
 		if !ok {
 			continue
@@ -225,9 +225,15 @@ func placeholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
 }
 
-func calKey(owner, calID string) string { return owner + "\x00" + calID }
+// CalKey is the canonical composite key identifying one calendar across owners: the
+// (owner, calID) pair, NUL-joined. It is the single source of truth for this format —
+// any package that keys a calendar by (owner, calID) (e.g. the live push hub's access
+// set) reuses it rather than re-deriving the separator, so the two can never drift.
+func CalKey(owner, calID string) string { return owner + "\x00" + calID }
 
-func splitKey(k string) (string, string) {
+// SplitCalKey is the inverse of CalKey: it recovers (owner, calID) from a composite key.
+// A key without the separator yields (k, "").
+func SplitCalKey(k string) (owner, calID string) {
 	if i := strings.IndexByte(k, 0); i >= 0 {
 		return k[:i], k[i+1:]
 	}

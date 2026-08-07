@@ -35,15 +35,11 @@ func New(st *store.Store) *Hub {
 	return h
 }
 
-// AccessKey is the composite key identifying one calendar across owners, matching the store's
-// (owner, calID) scoping. Callers build the access set for Subscribe from their shared calendars.
-func AccessKey(owner, calID string) string { return owner + "\x00" + calID }
-
 // Publish delivers a change to its owner's subscribers and to grantee subscribers who have access to
 // the changed calendar. Non-blocking: a full channel (slow client) drops the frame; that client
 // catches up via Last-Event-ID on reconnect.
 func (h *Hub) Publish(c store.Change) {
-	key := AccessKey(c.Owner, c.CalendarID)
+	key := store.CalKey(c.Owner, c.CalendarID)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for s := range h.subs[c.Owner] {
@@ -58,15 +54,15 @@ func (h *Hub) Publish(c store.Change) {
 }
 
 // Subscribe registers a live subscriber for user, plus the SHARED calendars (owner\x00calID keys,
-// e.g. via AccessKey) it may also receive. It returns the channel and an idempotent cancel that
+// e.g. via store.CalKey) it may also receive. It returns the channel and an idempotent cancel that
 // detaches and closes it (call exactly once). The subscriber is registered under its own username
 // and under every distinct owner in access, so changes from those owners reach it.
 func (h *Hub) Subscribe(user string, access map[string]bool) (<-chan store.Change, func()) {
 	s := &sub{ch: make(chan store.Change, 64), user: user, access: access}
 	owners := map[string]struct{}{user: {}}
 	for k := range access {
-		if i := indexNul(k); i >= 0 {
-			owners[k[:i]] = struct{}{}
+		if owner, _ := store.SplitCalKey(k); owner != "" {
+			owners[owner] = struct{}{}
 		}
 	}
 	h.mu.Lock()
@@ -93,13 +89,4 @@ func (h *Hub) Subscribe(user string, access map[string]bool) (<-chan store.Chang
 		})
 	}
 	return s.ch, cancel
-}
-
-func indexNul(s string) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == 0 {
-			return i
-		}
-	}
-	return -1
 }

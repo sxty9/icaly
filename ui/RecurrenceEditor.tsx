@@ -2,9 +2,9 @@
 // months/years", weekday selection for weekly rules, and an end condition (never / on a date /
 // after N occurrences). It edits the RRULE subset in helpers' RecurrenceRule model and emits an
 // RRULE string; rules it can't model still pass through the editor as raw text untouched. All
-// controls are @holistic/ui primitives (raw HTML is forbidden in service UIs).
+// controls are @holisdk/ui primitives (raw HTML is forbidden in service UIs).
 import { useMemo, useState } from 'react';
-import { Box, Button, Field, Input, Modal, SegmentedControl, Stack, Text, cn } from '@holistic/ui';
+import { Box, Button, Field, Input, Modal, SegmentedControl, Stack, Text, cn } from '@holisdk/ui';
 import { RRULE_WEEKDAYS, buildRRule, isoToDateInput, parseRRule, type RecurEnd, type RecurFreq, type RecurrenceRule } from './helpers';
 
 interface RecurrenceEditorProps {

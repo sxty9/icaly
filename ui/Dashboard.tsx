@@ -33,7 +33,7 @@ import {
   type ContactOption,
   type MenuItem,
   type ServiceContextProps,
-} from '@holistic/ui';
+} from '@holisdk/ui';
 import type { Calendar, CalendarsResp, CalEvent, ViewMode } from './types';
 import { COLORS, addDays, monthLabel, monthMatrix, startOfDay, startOfWeek, weekLabel } from './helpers';
 import { useLiveEvents } from './useLiveEvents';

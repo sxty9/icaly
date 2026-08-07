@@ -1,6 +1,6 @@
 // AgendaView is a chronological, day-grouped list — the densest, most "portioned" view
 // (Minimalism maxim) and the natural fallback on small screens.
-import { Box, EmptyState, Stack, Text, cn } from '@holistic/ui';
+import { Box, EmptyState, Stack, Text, cn } from '@holisdk/ui';
 import type { CalEvent } from './types';
 import { byStart, colorCss, fmtDayLong, fmtTime } from './helpers';
 
